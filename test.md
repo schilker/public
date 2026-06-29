@@ -120,7 +120,7 @@ flowchart TD
         STAGEMAN[("Stage Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-stage-{region}\nfixed key · BucketOwnerEnforced")]
         subgraph SP["Model Promotion Pipeline"]
             direction LR
-            SS1["S3 Source"]
+            SS1["S3 Source\n(watches manifest object)"]
             SS2["CopyModels\ngold(dev)→gold(stage)"]
             SS3["RegisterModel\nlocal · sets Approved · idempotent"]
             SS1 --> SS2 --> SS3
@@ -140,7 +140,7 @@ flowchart TD
         PRODMAN[("Prod Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-prod-{region}\nfixed key · BucketOwnerEnforced")]
         subgraph PP["Model Promotion Pipeline"]
             direction LR
-            PP1["S3 Source"]
+            PP1["S3 Source\n(watches manifest object)"]
             PP2["CopyModels\ngold(stage)→gold(prod)"]
             PP4(["[UI] Manual Approval\n7-day expiry"])
             PP3["RegisterModel\nsets Approved AFTER gate"]
@@ -171,6 +171,18 @@ The prod Manual Approval runs before RegisterModel writes `Approved`, so a sched
 **Human touchpoints (UI) — all in the dev account:** (1) ML Lead governance decision (Approve / Shadow / Reject) in the registry; (2) Promote → stage via the Promote Control; (3) Promote → prod via the Promote Control. The only UI action outside dev is (4) the CodePipeline approval gate in the prod account. The quality gate is automated. The Promote Control writes `promote_to` and emits the event that drives the orchestrator. Stage/prod registries take no human edits (IAM-locked).
 
 > **Trigger wiring:** SageMaker does not emit native EventBridge events for tag changes (only for `ModelApprovalStatus`). So promotion goes through the **Promote Control**, which writes the `promote_to` tag *and* emits a custom EventBridge event (`PutEvents`) — instant, precisely scoped, no CloudTrail dependency. A CloudTrail rule on `AddTags` / `UpdateModelPackage` is wired as a **fallback** to catch out-of-band tag edits made directly in the registry.
+
+**Manifest vs. S3 Source (both net-new — these are two different things):**
+
+- **Promotion manifest** = a small JSON file the dev orchestrator writes to the **manifest bucket** (one per target env). It is the *instruction* for a single promotion. Shape:
+  ```json
+  { "family": "h2h_commercial", "model": "ccm_readm", "version": "20260416_2253",
+    "candidate_type": "release", "source_gold": "s3://bcnc-gold-mlops-hub-dev-us-east-1/...",
+    "target_gold": "s3://bcnc-gold-mlops-hub-stage-us-east-1/..." }
+  ```
+- **S3 Source** = the Model Promotion CodePipeline's **first action** (a CodePipeline source of type S3). It *watches* that one manifest object at a **fixed S3 key** and **auto-starts the pipeline** whenever the object changes.
+
+So the bucket/JSON is the *what to promote*; the S3 Source is the *trigger that reacts to it*. This is why the new pipeline is **S3-triggered**, in contrast to the Infra CD pipeline, which is **GitHub-triggered** (`GitHub_Source`). Nothing in the repo uses an S3-triggered pipeline today, so both the manifest bucket and the S3-source pipeline are net-new. (Because the source is one fixed key, the manifest content must change per promotion — e.g. include the version — or the source won't re-trigger; see Failure Modes.)
 
 ---
 
@@ -241,7 +253,7 @@ flowchart TD
         end
         subgraph MODELPIPE["② Model Promotion CodePipeline  (manifest triggered)"]
             direction LR
-            M1["S3 Source\nmanifest (fixed key)"]
+            M1["S3 Source\nwatches manifest (fixed key)"]
             M2["CopyModels\n(CodeBuild action)"]
             M4(["Manual Approval\nprod only · before register"])
             M3["RegisterModel\nLambda · idempotent · sets Approved"]
@@ -617,22 +629,61 @@ The shared `gold` / `ephemeral` buckets and their CMKs are **not created by this
 
 ---
 
+## What's Essential vs Optional (build tiers)
+
+Most of the net-new apparatus is a *choice*, not a requirement. Build it in tiers — the four-piece **Core** is a working registry-first promotion on its own; everything else is layered on for the prod gate, hands-off triggering, or features.
+
+### Tier 1 — Core (cannot promote without these)
+
+| Piece | Why essential |
+|-------|---------------|
+| **CopyModels** (artifact → target gold) | Inference reads the *local* gold bucket; the bytes must physically get there. Reuses existing `copy_project`. |
+| **RegisterModel** (Approved entry in target registry) | Inference selects from the *local* registry; something must write the Approved version locally. |
+| **Runtime selection** (stop baking `MODEL_VERSION`) | This *is* registry-first. Keep baking the version and you don't need any of this — just edit the catalog and redeploy (today's system). |
+| **Reconcile `ModelRegistryConstruct`** | Otherwise the enforcement Lambda Rejects promoted versions on the next deploy. Non-negotiable. |
+
+**Leanest working version:** human approves in dev → trigger the promotion (manually) → CopyModels → RegisterModel; plus stop baking `MODEL_VERSION` and neuter the enforcement Lambda. That's a complete registry-first promotion.
+
+### Tier 2 — Needed only because we use CodePipeline (to get the prod gate)
+
+| Piece | Essential? |
+|-------|-----------|
+| **Manifest bucket + S3 Source** | Not fundamental to registry-first. They exist because the promotion runs as a **CodePipeline**, and a CodePipeline needs a source. The manifest does double duty — it's the **trigger** *and* the **input artifact** carrying the promotion parameters to the Copy/Register actions. |
+| **Model Promotion CodePipeline** | Chosen mainly for the **native prod Manual Approval gate** (a Lambda can't block for hours). |
+
+**Alternative:** the orchestrator drives CodeBuild directly (`StartBuild` + register, no CodePipeline) — fewer moving parts, no manifest/S3-source — but then you must **re-build the prod approval gate** yourself. Keep CodePipeline → you need the manifest + S3 Source. Drop it → you don't, but you re-invent the gate.
+
+### Tier 3 — Convenience / governance (defer or simplify)
+
+| Piece | Can you skip it? |
+|-------|------------------|
+| **Promote Control + custom EventBridge event** | Yes — invoke the orchestrator by hand (CLI) to start. The Control is UX + reliable triggering, not correctness. |
+| **Dev Orchestrator Lambda** (centralized decision) | Partly — a human could pass the version straight to the pipeline. You'd lose "dev is the single source" + the forward-only gate, but it still promotes. |
+| **Shadow inference branches** | Yes, entirely — only if you actually run shadows. |
+| **Quality gate** | Yes — advisory / phase-2 (it does not exist today and has no defined thresholds; do not block release on it initially). |
+
+---
+
 ## Implementation Checklist
 
-- [ ] Reconcile `ModelRegistryConstruct` (retire/scope `_enforce_catalog_statuses`).
-- [ ] Stop baking `MODEL_VERSION`; select latest `Approved`+`release` (tag filter in code).
-- [ ] Per-model inference branches (release + N shadows) built at synth from the family's model list; release → `results/`, shadow → `shadow-outputs/`.
-- [ ] `promote_to` flag in the tag contract; IAM-restrict who can set it (Promote Control role only).
-- [ ] Promote Control (thin UI/CLI/Lambda): writes `promote_to` tag + `PutEvents` custom event.
-- [ ] EventBridge rule on the custom `PromoteRequested` event (primary); CloudTrail `AddTags`/`UpdateModelPackage` rule as fallback.
-- [ ] Dev orchestrator Lambda: read `promote_to`, validate, route to the correct target account (stage: dev-gold check; prod: stage-gold gate); idempotent.
-- [ ] Manifest bucket created in **`mlops-hub`** (`bcnc-manifest-mlops-hub-{env}-{region}` or a shared prefix; name/CMK to SSM; fixed key, `BucketOwnerEnforced`, notifications on).
-- [ ] Model Promotion Pipeline (S3 source → CopyModels → [prod approval] → RegisterModel).
-- [ ] RegisterModel Lambda (local, idempotent, sets Approved).
-- [ ] Cross-account grants X1–X5.
-- [ ] IAM/SCP lockdown of stage/prod registry writes.
-- [ ] S3 lifecycle/retention for gold + registry versions.
-- [ ] Break-glass de-promote mode.
+Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate), **[Opt]** = Tier 3.
+
+- [ ] **[Core]** Reconcile `ModelRegistryConstruct` (retire/scope `_enforce_catalog_statuses`).
+- [ ] **[Core]** Stop baking `MODEL_VERSION`; select latest `Approved`+`release` (tag filter in code).
+- [ ] **[Core]** RegisterModel Lambda (local, idempotent, sets Approved).
+- [ ] **[Core]** CopyModels — reuse `copy_project` (us-east-1) to copy artifact into target gold.
+- [ ] **[Gate]** Model Promotion CodePipeline (S3 source → CopyModels → [prod approval] → RegisterModel).
+- [ ] **[Gate]** Manifest bucket in **`mlops-hub`** (`bcnc-manifest-mlops-hub-{env}-{region}` or a shared prefix; name/CMK to SSM; fixed key, `BucketOwnerEnforced`, notifications on).
+- [ ] **[Gate]** Cross-account grants X1–X5.
+- [ ] **[Opt]** `promote_to` flag in the tag contract; IAM-restrict who can set it (Promote Control role only).
+- [ ] **[Opt]** Promote Control (thin UI/CLI/Lambda): writes `promote_to` tag + `PutEvents` custom event.
+- [ ] **[Opt]** EventBridge rule on the custom `PromoteRequested` event (primary); CloudTrail `AddTags`/`UpdateModelPackage` rule as fallback.
+- [ ] **[Opt]** Dev orchestrator Lambda: read `promote_to`, validate, route to the correct target account (stage: dev-gold check; prod: stage-gold gate); idempotent.
+- [ ] **[Opt]** Per-model inference branches (release + N shadows) built at synth; release → `results/`, shadow → `shadow-outputs/`.
+- [ ] **[Opt]** Quality gate (advisory first; define thresholds later).
+- [ ] **[Core]** IAM/SCP lockdown of stage/prod registry writes.
+- [ ] **[Opt]** S3 lifecycle/retention for gold + registry versions.
+- [ ] **[Opt]** Break-glass de-promote mode.
 
 ---
 
