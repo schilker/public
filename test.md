@@ -4,7 +4,7 @@
 
 **Core rule:** A model stays in dev until a human sets `status=Approved` + `promote=true` in the **dev registry**. The dev registry is the single governance source for all environments. Stage and prod registries are projections written only by the promotion pipeline; "read-only" means no human edits, enforced with IAM.
 
-**Promotion is manual at every hop, driven by a flag in the dev registry.** Approval only blesses a version — it does not move anything. A human then sets a `promote_to` flag (`stage`, then later `prod`) on the model in the **dev** registry. That tag change drives EventBridge → a single orchestrator Lambda, which routes the artifact to the correct target account. All UI happens in dev; the two hops are symmetric; prod adds a CodePipeline approval gate. There is no automatic dev→stage promotion.
+**Promotion is manual at every hop, driven by the model's native `ModelLifeCycle` stage in the dev registry.** Approval (`Approved` + `promote=true`) only blesses a version — it does not move anything. A human then advances the version's native **`ModelLifeCycle.Stage`** (`Staging`, then later `Production`) from Studio's *Update model lifecycle* action. That transition emits a native `SageMaker Model Package State Change` EventBridge event (`UpdatedModelPackageFields=["ModelLifeCycle"]`), which a rule routes to a single orchestrator Lambda; the orchestrator reads the target stage from the event payload and routes the artifact to the correct account. All UI happens in dev (native Studio actions — no CLI, no hand-edited tags); the two hops are symmetric; prod adds a CodePipeline approval gate. There is no automatic dev→stage promotion.
 
 **Selection:** The inference pipeline selects the current `Approved` + `candidate_type=release` model at execution time from the local registry. A model-version change requires no CDK redeploy and no pipeline upsert — the next scheduled run picks it up.
 
@@ -16,40 +16,31 @@
 |---------|---------|--------|
 | Inference selection | Container queries the registry at runtime (`batch_inference_processing.py:67-99`) but matches the `MODEL_VERSION` baked at synth from `model_catalog.json` (`sagemaker_inference_pipeline.py:548-592`). | Select latest `Approved`+`release` instead of a pinned version. The `version=None` path already returns latest Approved (`batch_inference_processing.py:78-79`). Stop baking `MODEL_VERSION`; filter tags in code. |
 | Version source of truth | `model_catalog.json` `model_versions.approved[]/pending[]`. | Registry tags + status; catalog holds static topology only. |
-| Per-env registry authority | `ModelRegistryConstruct` runs on every `cdk deploy`; `_enforce_catalog_statuses()` rejects any version not in the catalog (`model_registry_handler.py:244-280`). | RegisterModel step is the writer; enforcement retired or scoped (see Reconciliation). |
+| Per-env registry authority | `ModelRegistryConstruct` runs on every `cdk deploy`; `_enforce_catalog_statuses()` rejects any version not in the catalog (`model_registry_handler.py:244-280`). | RegisterModel step is the writer; remove the enforcement (see "Updating `model_registry_handler.py`"). |
 | Artifact copy | `copy_project` CodeBuild (us-east-1 only) via `sync_models.py` selective per-version copy. | Reused by the new Model Promotion Pipeline. |
 | Shared buckets (gold/silver/ephemeral) | This repo creates gold/silver in `artifact_bucket_stack.py`. | Owned by **`mlops-hub`** (`bcnc-{tier}-mlops-hub-{env}-{region}`, names/CMKs in SSM); this repo imports via `from_bucket_name`. Silver eliminated; manifest bucket added in `mlops-hub`. |
-| Promote Control, EventBridge rule, orchestrator, manifest bucket, S3-source pipeline, RegisterModel, shadow inference branches | None exist. | All net-new. |
+| `ModelLifeCycle` stage transitions as the promotion trigger, EventBridge rule, orchestrator, manifest bucket, S3-source pipeline, RegisterModel, shadow inference branches | None exist. | All net-new (the trigger is the native `ModelLifeCycle` event — no custom Promote Control or `PutEvents`). |
 
 A `Type:Lambda` step is expressible in the raw `CfnPipeline` JSON, so runtime selection does not require an SDK migration; the cheapest path is container-side selection plus removing the synth-time version pin.
 
 ---
 
-## Reconciliation with `ModelRegistryConstruct`
+## Updating `model_registry_handler.py` (one gotcha to avoid)
 
-```mermaid
-flowchart LR
-    classDef bad fill:#b71c1c,stroke:#7f0000,color:#fff
-    classDef auto fill:#1565c0,stroke:#0d47a1,color:#fff
+**Purpose of this note:** updating this Lambda is just part of the migration — but there's one non-obvious way to get it *partly* right that silently breaks promotion, so it's called out here.
 
-    RM["RegisterModel registers version V\nas Approved from the manifest"]
-    DEPLOY["Any later cdk deploy\n(unrelated infra change)"]
-    ENF["ModelRegistryConstruct\nruns every deploy\nV not in model_catalog.json"]
-    FLIP["V flipped to Rejected"]
-    INF["Inference query status=Approved\nno longer finds V → serving breaks"]
+**Today**, `model_registry_handler.py` keeps the registry in sync with `model_catalog.json`, and `_enforce_catalog_statuses()` **Rejects any registry version not listed in the catalog — on every `cdk deploy`**. Registry-first promotion deliberately registers versions that are *not* in the catalog. So if that Reject behavior survives your rewrite, the **next unrelated `cdk deploy` silently flips your promoted models to `Rejected`** and inference stops finding them.
 
-    RM --> DEPLOY --> ENF --> FLIP --> INF
-    class RM,DEPLOY,ENF auto
-    class FLIP,INF bad
-```
+**The change to make:**
 
-Registry-first promotion bypasses `model_catalog.json`, but `_enforce_catalog_statuses()` rejects any registry version not listed there on every deploy. Resolve before adoption:
+| Keep | Remove |
+|------|--------|
+| Model Package Group creation | The catalog version-sync (`approved[0]`/`pending[]` → registry) |
+| | `_enforce_catalog_statuses()` — the Reject-on-not-in-catalog behavior |
 
-| Option | Change | Trade-off |
-|--------|--------|-----------|
-| A (recommended) | Remove `_enforce_catalog_statuses()`; keep group creation. RegisterModel is sole status authority. | Loses catalog guardrail during migration. |
-| B | Make enforcement ignore versions tagged `promoted_by=reconciler`. | Two writers coexist. |
-| C | Reconciler also updates `model_catalog.json` per promotion. | Re-introduces catalog coupling. |
+After this, **RegisterModel is the sole status authority**. Do **not** retain catalog status enforcement — note the original Files-Affected guidance said *"retain tag enforcement,"* which would reintroduce exactly this bug.
+
+> Clean cutover (recommended): remove it outright. If instead you migrate **family-by-family**, temporarily scope `_enforce_catalog_statuses()` to ignore versions tagged `promoted_by=reconciler` during the transition, then remove it once all families are migrated.
 
 ---
 
@@ -57,23 +48,24 @@ Registry-first promotion bypasses `model_catalog.json`, but `_enforce_catalog_st
 
 All governance state lives on the **model package version** in the SageMaker Model Registry — not in `model_catalog.json`. One Model Package Group per `{app}-{family}-{model}`; one version per training run; tags/status attach to each version.
 
-**Two storage slots on a version:**
+**Three storage slots on a version:**
 
 | Field | Storage | Set via |
 |-------|---------|---------|
 | `ModelApprovalStatus` (Approved / Rejected / Pending) | Native first-class field | `UpdateModelPackage`, or the Studio Model Registry "Update status" button |
-| `carepath:promote`, `candidate_type`, `quality_gate_passed`, `promote_to`, `version`, `git_sha`, `data_snapshot` | Resource **tags** (governance flags) or `CustomerMetadataProperties` (lineage) | `AddTags` / `UpdateModelPackage` — via the Promote Control or automation |
+| `ModelLifeCycle` (`Stage` + `StageStatus`) — the promotion **trigger** | Native first-class field (both required strings, ≤63 chars) | `UpdateModelPackage` / `CreateModelPackage`, or the Studio "Update model lifecycle" action |
+| `carepath:promote`, `candidate_type`, `quality_gate_passed`, `version`, `git_sha`, `data_snapshot` — governance **eligibility** + lineage | Resource **tags** (governance flags) or `CustomerMetadataProperties` (lineage) | `AddTags` / `UpdateModelPackage` — by training automation or the ML Lead's bless |
 
 **Who sets what:**
 
 | Actor | Fields | Mechanism |
 |-------|--------|-----------|
-| Training pipeline (registration) | `version`, `git_sha`, `candidate_type=release` (default), `promote=false` | `CreateModelPackage` |
+| Training pipeline (registration) | `version`, `git_sha`, `candidate_type=release` (default), `promote=false`; `ModelLifeCycle = Development / PendingApproval` | `CreateModelPackage` |
 | Automation (Lambda / Clarify) | `quality_gate_passed` | `AddTags` |
-| ML Lead — bless | `ModelApprovalStatus`, `candidate_type`, `promote` | Studio UI / API |
-| ML Lead — promote | `promote_to=stage`, then `=prod` | **Promote Control** (writes the tag + emits the trigger event) |
+| ML Lead — bless | `ModelApprovalStatus=Approved`, `candidate_type`, `promote=true` | Studio "Update status" / API |
+| ML Lead — promote | `ModelLifeCycle.Stage = Staging`, then `= Production` | Studio "Update model lifecycle" (native — emits the trigger event) |
 
-**Why a Promote Control:** the Studio UI handles approval status well but is poor for hand-editing custom tags, and nobody should run `aws sagemaker add-tags` by hand to ship a model. A thin control (internal UI / CLI / Lambda) is the entry point for `promote_to` — and it is also what reliably fires the trigger (Diagram 1). Use **tags** (not `CustomerMetadataProperties`) for `promote` / `promote_to` so IAM can condition on the tag key and restrict who may promote; keep metadata for descriptive lineage.
+**Why `ModelLifeCycle` and not a custom tag:** SageMaker emits a native EventBridge event when `ModelLifeCycle` (or `ModelApprovalStatus`) changes, but **not** when a tag changes. Encoding the "move" signal in a custom `promote_to` tag therefore needs a bespoke control to write the tag *and* manufacture an event (the old Promote Control + `PutEvents` + CloudTrail fallback). `ModelLifeCycle` is the native, first-class field built for exactly this: a human advances the stage from the Studio UI (no CLI, no `aws sagemaker add-tags`), the change emits the trigger event for free, and access is gated natively with the `sagemaker:ModelLifeCycle:stage` / `:stageStatus` IAM condition keys (see Governance Enforcement). Keep `candidate_type` / `promote` / `quality_gate_passed` as **eligibility** flags the orchestrator reads — they no longer carry the trigger, so the tag-vs-metadata choice is purely about IAM conditioning of the bless, not the move.
 
 ---
 
@@ -103,15 +95,13 @@ flowchart TD
         DEVREG -. "review" .-> APPROVE
         APPROVE -- "UpdateModelPackage + AddTags" --> DEVREG
 
-        PROMOTE(["[UI] ML Lead\nPromote → stage, then prod"])
-        PCTRL["Promote Control (NEW)\nthin UI / CLI / Lambda\n① AddTags promote_to on version\n② PutEvents custom event"]
-        EB["EventBridge Rule\non custom PromoteRequested event\n(fallback: CloudTrail AddTags)"]
-        ORCH["Dev Orchestrator Lambda\nreads promote_to, validates,\nwrites manifest to target account\nprod: HeadObject stage-gold gate"]
+        PROMOTE(["[UI] ML Lead — Update model lifecycle\nStage=Staging, then Stage=Production\n(native Studio action)"])
+        EB["EventBridge Rule\nSageMaker Model Package State Change\nUpdatedModelPackageFields=[ModelLifeCycle]"]
+        ORCH["Dev Orchestrator Lambda\ntarget = detail.ModelLifeCycle.Stage,\nvalidates eligibility, writes manifest\nprod: HeadObject stage-gold gate"]
 
         APPROVE -. "after bless" .-> PROMOTE
-        PROMOTE --> PCTRL
-        PCTRL -- "AddTags promote_to" --> DEVREG
-        PCTRL -- "PutEvents" --> EB
+        PROMOTE -- "UpdateModelPackage ModelLifeCycle.Stage" --> DEVREG
+        DEVREG -- "native event" --> EB
         EB --> ORCH
     end
 
@@ -156,21 +146,21 @@ flowchart TD
         PRODGOLD -. "runtime read" .-> PRODINF
     end
 
-    ORCH -- "promote_to=stage\ncross-acct PutObject" --> STAGEMAN
-    ORCH -- "promote_to=prod\ncross-acct PutObject" --> PRODMAN
+    ORCH -- "Stage=Staging\ncross-acct PutObject" --> STAGEMAN
+    ORCH -- "Stage=Production\ncross-acct PutObject" --> PRODMAN
 
     class APPROVE,PROMOTE,PP4 human
     class TRAIN,QG,SS2,PP2,STAGEINF,PRODINF auto
-    class EB,ORCH,PCTRL,SS1,SS3,PP1,PP3,STAGEMAN,PRODMAN new
+    class EB,ORCH,SS1,SS3,PP1,PP3,STAGEMAN,PRODMAN new
     class DEVGOLD,STAGEGOLD,PRODGOLD store
     class DEVREG,STAGEREG,PRODREG reg
 ```
 
 The prod Manual Approval runs before RegisterModel writes `Approved`, so a scheduled run cannot serve an unapproved model. CopyModels may run before the gate; the artifact sits in prod gold unserved until the gated registration.
 
-**Human touchpoints (UI) — all in the dev account:** (1) ML Lead governance decision (Approve / Shadow / Reject) in the registry; (2) Promote → stage via the Promote Control; (3) Promote → prod via the Promote Control. The only UI action outside dev is (4) the CodePipeline approval gate in the prod account. The quality gate is automated. The Promote Control writes `promote_to` and emits the event that drives the orchestrator. Stage/prod registries take no human edits (IAM-locked).
+**Human touchpoints (UI) — all in the dev account:** (1) ML Lead governance decision (Approve / Shadow / Reject) via "Update status" in the registry; (2) Promote → stage by setting `ModelLifeCycle.Stage=Staging`; (3) Promote → prod by setting `ModelLifeCycle.Stage=Production` — both via Studio's native "Update model lifecycle" action. The only UI action outside dev is (4) the CodePipeline approval gate in the prod account. The quality gate is automated. Each lifecycle transition emits the native event that drives the orchestrator. Stage/prod registries take no human edits (IAM-locked).
 
-> **Trigger wiring:** SageMaker does not emit native EventBridge events for tag changes (only for `ModelApprovalStatus`). So promotion goes through the **Promote Control**, which writes the `promote_to` tag *and* emits a custom EventBridge event (`PutEvents`) — instant, precisely scoped, no CloudTrail dependency. A CloudTrail rule on `AddTags` / `UpdateModelPackage` is wired as a **fallback** to catch out-of-band tag edits made directly in the registry.
+> **Trigger wiring:** Promotion is driven by the model's native `ModelLifeCycle` stage, not a custom tag — precisely because SageMaker emits a native `SageMaker Model Package State Change` EventBridge event when `ModelLifeCycle` (or `ModelApprovalStatus`) changes, but **not** when a tag changes. Advancing the stage in Studio fires the event for free (`source=aws.sagemaker`, `detail-type="SageMaker Model Package State Change"`, `detail.UpdatedModelPackageFields=["ModelLifeCycle"]`, `detail.ModelLifeCycle.Stage` = the target env). No Promote Control, no `PutEvents`, and no CloudTrail fallback are needed: the trigger is first-class. The orchestrator routes on the `Stage` carried in the event payload (so it never re-reads a tag under a read-after-write race) and re-reads the version only to validate eligibility (`Approved` + `promote` + `candidate_type` + `quality_gate`).
 
 **Manifest vs. S3 Source (both net-new — these are two different things):**
 
@@ -193,23 +183,23 @@ flowchart TD
     classDef human fill:#e65100,stroke:#bf360c,color:#fff,font-weight:bold
     classDef auto  fill:#1565c0,stroke:#0d47a1,color:#fff
 
-    subgraph DS["Dev → Stage  (control-triggered)"]
+    subgraph DS["Dev → Stage  (lifecycle-triggered)"]
         direction LR
         T2a(["[UI] Approve\nApproved + promote=true\n(bless, no movement)"])
-        T2(["[UI] Promote → stage\n(Promote Control)"])
-        A0["AddTags promote_to=stage\n+ PutEvents custom event"]
+        T2(["[UI] Update model lifecycle\nStage=Staging"])
+        A0["Native event\nModelLifeCycle changed"]
         A1["EventBridge → orchestrator"]
-        A2["Orchestrator Lambda\nroutes to stage · write manifest"]
+        A2["Orchestrator Lambda\ntarget=Staging · validate · write manifest"]
         A3["Stage CodePipeline\nS3 source"]
         A4["CopyModels → RegisterModel"]
         A6["Next inference run\nselects Approved+release"]
         T2a --> T2 --> A0 --> A1 --> A2 --> A3 --> A4 -.-> A6
     end
 
-    subgraph SPx["Stage → Prod  (control-triggered + gate)"]
+    subgraph SPx["Stage → Prod  (lifecycle-triggered + gate)"]
         direction LR
-        T3(["[UI] Promote → prod\n(Promote Control)"])
-        B0a["AddTags promote_to=prod\n+ PutEvents custom event"]
+        T3(["[UI] Update model lifecycle\nStage=Production"])
+        B0a["Native event\nModelLifeCycle changed"]
         B0["EventBridge → orchestrator"]
         B1["Orchestrator Lambda\nHeadObject stage-gold gate · write manifest"]
         B2["Prod CodePipeline\nS3 source"]
@@ -277,7 +267,7 @@ flowchart TD
 
 ---
 
-## Diagram 4 — Tag Lifecycle & Gates
+## Diagram 4 — Model Lifecycle & Gates
 
 ```mermaid
 flowchart TD
@@ -292,9 +282,9 @@ flowchart TD
     S1B["1B Quality Gate Passed\nPending · promote=false\nquality_gate=true\nblocked"]
     S1C["1C Rejected\nstatus=Rejected\npermanently blocked"]
     S1D["1D Test / POC\npromote=false\ncandidate_type=test / poc\npermanently blocked"]
-    S2A["2A Approved Release\nApproved · promote=true\nquality_gate=true · release\neligible — set promote_to=stage to move"]
-    S2B["2B Approved Shadow\nApproved · promote=true\ncandidate_type=shadow\neligible — set promote_to=stage to move"]
-    STAGE["IN STAGE\nstage gold + registry Approved\ninference selects at runtime\nprod: manual trigger + gold check"]
+    S2A["2A Approved Release\nApproved · promote=true\nquality_gate=true · release\neligible — set Stage=Staging to move"]
+    S2B["2B Approved Shadow\nApproved · promote=true\ncandidate_type=shadow\neligible — set Stage=Staging to move"]
+    STAGE["IN STAGE\nstage gold + registry Approved\ninference selects at runtime\nprod: set Stage=Production + gold check"]
     PRODQ["PROD QUEUED\nprod gold present · paused at gate\nnot served (register follows gate)"]
     PROD["PROMOTED\nall gold + registries updated\ninference selects at runtime"]
 
@@ -306,9 +296,9 @@ flowchart TD
     S1B -->|"Approved+promote+shadow"| S2B
     S1B -->|"reject"| S1C
     S1B -->|"test/poc"| S1D
-    S2A -->|"set promote_to=stage"| STAGE
-    S2B -->|"set promote_to=stage"| STAGE
-    STAGE -->|"set promote_to=prod"| PRODQ
+    S2A -->|"set Stage=Staging"| STAGE
+    S2B -->|"set Stage=Staging"| STAGE
+    STAGE -->|"set Stage=Production"| PRODQ
     PRODQ -->|"approve → register"| PROD
 
     class S1A,S1B blocked
@@ -346,8 +336,8 @@ flowchart TD
     DEC -- "evaluate" --> SHAD
     DEC -- "experimental" --> TEST
     DEC -- "bad" --> REJ
-    EB1["eligible to promote\nset promote_to=stage, then =prod"]
-    EB2["eligible (shadow)\nset promote_to=stage, then =prod"]
+    EB1["eligible to promote\nset Stage=Staging, then =Production"]
+    EB2["eligible (shadow)\nset Stage=Staging, then =Production"]
     REL --> EB1
     SHAD --> EB2
 
@@ -446,7 +436,7 @@ flowchart TD
 
 ## Scenarios
 
-Every model starts at 1A. Approval (`Approved` + `promote=true`) only *blesses* a version; promoting it via the Promote Control (which sets `promote_to=stage`, then `=prod`) is what actually moves it. The control writes the flag and emits the event that drives the orchestrator → the target account.
+Every model starts at 1A. Approval (`Approved` + `promote=true`) only *blesses* a version; advancing its native `ModelLifeCycle.Stage` (`Staging`, then `Production`) from Studio is what actually moves it. The stage change emits the native event that drives the orchestrator → the target account.
 
 ### Scenario 1 — Version only in Dev (never promoted)
 
@@ -461,7 +451,7 @@ The default state of every model; it stays here until tags explicitly enable pro
 | `carepath:quality_gate_passed` | `false` |
 | `carepath:candidate_type` | `release` (default) |
 
-Not eligible: `promote_to` unset, and even if set the orchestrator rejects it (not Approved, promote=false, quality_gate=false).
+Not eligible: still `Stage=Development`, and even if advanced the orchestrator rejects it (not Approved, promote=false, quality_gate=false).
 
 **1B — Quality gate passes (automated)**
 
@@ -494,11 +484,11 @@ Rejected — permanently excluded from all orchestrator queries.
 | `carepath:quality_gate_passed` | `true` or `false` |
 | `carepath:candidate_type` | `test` or `poc` |
 
-Not eligible (promote=false, candidate_type=test/poc); the orchestrator filters it out even if `promote_to` is set.
+Not eligible (promote=false, candidate_type=test/poc); the orchestrator filters it out even if the stage is advanced.
 
-### Scenario 2 — Approve, then flag to Stage
+### Scenario 2 — Approve, then advance to Stage
 
-Approval blesses the version; setting `promote_to=stage` triggers the move.
+Approval blesses the version; setting `ModelLifeCycle.Stage=Staging` triggers the move.
 
 **2A — Approve as release**
 
@@ -509,7 +499,7 @@ Approval blesses the version; setting `promote_to=stage` triggers the move.
 | `carepath:quality_gate_passed` | `true` (required for release) |
 | `carepath:candidate_type` | `release` |
 
-Approval blesses the version (no movement). The human promotes via the Promote Control (sets `promote_to=stage` + emits the custom event) → EventBridge → orchestrator validates (lists `Approved`, filters `promote=true` + `candidate_type=release` + `quality_gate=true` in code) → writes the stage manifest → stage pipeline runs (CopyModels → RegisterModel sets `Approved`, idempotent).
+Approval blesses the version (no movement). The human advances `ModelLifeCycle.Stage=Staging` in Studio → native event (`UpdatedModelPackageFields=["ModelLifeCycle"]`, `Stage=Staging`) → EventBridge → orchestrator validates the version (`Approved` + `promote=true` + `candidate_type=release` + `quality_gate=true`) → writes the stage manifest → stage pipeline runs (CopyModels → RegisterModel sets `Approved`, idempotent).
 
 **2B — Approve as shadow**
 
@@ -520,7 +510,7 @@ Approval blesses the version (no movement). The human promotes via the Promote C
 | `carepath:quality_gate_passed` | `true` or `false` (not required) |
 | `carepath:candidate_type` | `shadow` |
 
-Set `promote_to=stage`; orchestrator match: promote=true + Approved + candidate_type=shadow (quality gate not checked). Stage manifest carries `candidate_type=shadow` → stage wires it as a shadow slot (serves only `shadow-outputs/`, never primary traffic).
+Set `ModelLifeCycle.Stage=Staging`; orchestrator match: promote=true + Approved + candidate_type=shadow (quality gate not checked). Stage manifest carries `candidate_type=shadow` → stage wires it as a shadow slot (serves only `shadow-outputs/`, never primary traffic).
 
 **State after the stage pipeline completes:**
 
@@ -533,7 +523,7 @@ Prod Registry:   (empty for this version)
 Prod Gold:       no artifact
 ```
 
-Prod is blocked until a human promotes via the Promote Control (`promote_to=prod`), which triggers the orchestrator to check:
+Prod is blocked until a human advances `ModelLifeCycle.Stage=Production`, which triggers the orchestrator to check:
 
 ```
 stage gold HeadObject → found ✓   (403/404 → flag stage first, retryable)
@@ -543,9 +533,9 @@ quality_gate=true     ✓  (release)
 → write prod manifest
 ```
 
-### Scenario 3 — Flag to prod, version reaches Prod
+### Scenario 3 — Advance to Production, version reaches Prod
 
-After the human sets `promote_to=prod` and the prod pipeline clears the approval gate (RegisterModel writes `Approved` *after* the gate):
+After the human sets `ModelLifeCycle.Stage=Production` and the prod pipeline clears the approval gate (RegisterModel writes `Approved` *after* the gate):
 
 ```
 Dev Registry:    Approved, promote=true, quality_gate=true, candidate_type=release
@@ -556,22 +546,22 @@ Prod Registry:   Approved (projection)
 Prod Gold:       artifact present  ✓
 ```
 
-All inference pipelines select this version at runtime. The dev registry tags (including `promote_to=prod`) are the permanent governance record. No CDK redeploy at any point. Shadows reach prod via the same flag with the quality-gate check dropped.
+All inference pipelines select this version at runtime. The dev registry record — `ModelApprovalStatus`, the eligibility tags, and the `ModelLifeCycle` history (`Development → Staging → Production`) — is the permanent governance trail. No CDK redeploy at any point. Shadows reach prod via the same stage advance with the quality-gate check dropped.
 
 ### The single rule that controls everything
 
 ```
 promote=false   OR   status≠Approved   OR   quality_gate=false (release)
-    → not eligible · orchestrator rejects the flag · nothing moves
+    → not eligible · orchestrator rejects the transition · nothing moves
 
-promote=true  AND  status=Approved  AND  quality_gate=true (release)  AND  promote_to=stage
-    → EventBridge → orchestrator → stage pipeline
+promote=true  AND  status=Approved  AND  quality_gate=true (release)  AND  Stage=Staging
+    → native event → orchestrator → stage pipeline
 
-promote=true  AND  status=Approved  AND  candidate_type=shadow  AND  promote_to=stage
-    → EventBridge → orchestrator → stage pipeline (shadow slot)
+promote=true  AND  status=Approved  AND  candidate_type=shadow  AND  Stage=Staging
+    → native event → orchestrator → stage pipeline (shadow slot)
 
-stage gold present  AND  promote_to=prod
-    → EventBridge → orchestrator → prod pipeline · approval gate · register after gate
+stage gold present  AND  Stage=Production
+    → native event → orchestrator → prod pipeline · approval gate · register after gate
 ```
 
 ### Scenario 4 — Emergency Rollback (break-glass)
@@ -580,7 +570,7 @@ Never hand-edit the stage/prod registry.
 
 | Step | Action |
 |------|--------|
-| 1 | In the dev registry, clear `promote_to` and set `promote=false` / `Rejected` on the bad version; the orchestrator's de-promote path sets the same in the target registry |
+| 1 | In the dev registry, set `ModelApprovalStatus=Rejected` (and `ModelLifeCycle.StageStatus=Rejected`) on the bad version; this emits a native event the orchestrator's de-promote path consumes and applies the same in the target registry |
 | 2 | Previous Approved version (retained in gold + registry) is selected automatically next run |
 | 3 | Confirm the target registry reflects the change (orchestrator de-promote, not a hand edit) |
 | 4 | Record incident + CloudTrail reference |
@@ -595,8 +585,8 @@ Never hand-edit the stage/prod registry.
 | RegisterModel fails after copy | Artifact present, no Approved entry (safe) | Re-run; idempotent |
 | Pipeline re-executed | Risk of duplicate Approved versions | Idempotent RegisterModel matches by source timestamp |
 | Identical manifest overwrite | S3 source may not re-trigger | Manifest content changes per promotion (include ts) |
-| Approval not actioned in 7 days | Prod execution fails | Re-set `promote_to=prod` to re-fire |
-| Duplicate trigger events for one promotion (custom event re-delivered, or the CloudTrail fallback also fires) | Orchestrator may run twice | Manifest is deterministic + RegisterModel idempotent → no-op on the second run |
+| Approval not actioned in 7 days | Prod execution fails | Re-apply `ModelLifeCycle.Stage=Production` (re-emits the native event) to re-fire |
+| Duplicate native events for one promotion (e.g. a stage re-applied) | Orchestrator may run twice | Manifest is deterministic + RegisterModel idempotent → no-op on the second run |
 
 ---
 
@@ -604,8 +594,18 @@ Never hand-edit the stage/prod registry.
 
 - Only the RegisterModel role may `CreateModelPackage` / `UpdateModelPackage` / `AddTags` on stage/prod registries; deny to humans and the legacy enforcement role via IAM/SCP.
 - `candidate_type` is required on every Approved package; selection treats a missing value as non-release.
-- The orchestrator role can write both stage and prod manifests; forward-only and "prod gated" are operational (driven by `promote_to` + the stage-gold check + the CodePipeline approval gate), not IAM-enforced separation.
-- `promote_to` is the trigger flag — restrict `AddTags`/`UpdateModelPackage` on the model group to the Promote Control role so promotion intent is auditable; the CloudTrail fallback rule catches any direct edits that bypass the control.
+- The orchestrator role can write both stage and prod manifests; forward-only and "prod gated" are operational (driven by the target `ModelLifeCycle.Stage` + the stage-gold check + the CodePipeline approval gate), not IAM-enforced separation.
+- `ModelLifeCycle.Stage` is the trigger — gate it natively: scope `sagemaker:UpdateModelPackage` / `CreateModelPackage` with the `sagemaker:ModelLifeCycle:stage` / `sagemaker:ModelLifeCycle:stageStatus` condition keys so only the ML Lead role may set `Stage=Production` (and, if desired, `Stage=Staging`). Because the trigger is a first-class field with a native event and an audit trail, no CloudTrail fallback rule is needed. Example (lead-engineer role):
+  ```json
+  {
+    "Action": ["sagemaker:UpdateModelPackage"],
+    "Resource": ["*"],
+    "Condition": { "StringEquals": {
+      "sagemaker:ModelLifeCycle:stage": "Production",
+      "sagemaker:ModelLifeCycle:stageStatus": "PendingApproval"
+    } }
+  }
+  ```
 
 ---
 
@@ -657,7 +657,7 @@ Most of the net-new apparatus is a *choice*, not a requirement. Build it in tier
 
 | Piece | Can you skip it? |
 |-------|------------------|
-| **Promote Control + custom EventBridge event** | Yes — invoke the orchestrator by hand (CLI) to start. The Control is UX + reliable triggering, not correctness. |
+| **`ModelLifeCycle` trigger wiring (EventBridge rule)** | The rule is one line of config and the *trigger* is native (free). You can still invoke the orchestrator by hand to start, but there is no custom Promote Control or `PutEvents` to build. |
 | **Dev Orchestrator Lambda** (centralized decision) | Partly — a human could pass the version straight to the pipeline. You'd lose "dev is the single source" + the forward-only gate, but it still promotes. |
 | **Shadow inference branches** | Yes, entirely — only if you actually run shadows. |
 | **Quality gate** | Yes — advisory / phase-2 (it does not exist today and has no defined thresholds; do not block release on it initially). |
@@ -668,17 +668,17 @@ Most of the net-new apparatus is a *choice*, not a requirement. Build it in tier
 
 Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate), **[Opt]** = Tier 3.
 
-- [ ] **[Core]** Reconcile `ModelRegistryConstruct` (retire/scope `_enforce_catalog_statuses`).
+- [ ] **[Core]** Rewrite `model_registry_handler.py`: **keep** Model Package Group creation; **remove** the catalog version-sync AND `_enforce_catalog_statuses()` (the Reject-on-not-in-catalog behavior). RegisterModel becomes sole status authority — do not retain catalog status enforcement.
 - [ ] **[Core]** Stop baking `MODEL_VERSION`; select latest `Approved`+`release` (tag filter in code).
 - [ ] **[Core]** RegisterModel Lambda (local, idempotent, sets Approved).
 - [ ] **[Core]** CopyModels — reuse `copy_project` (us-east-1) to copy artifact into target gold.
 - [ ] **[Gate]** Model Promotion CodePipeline (S3 source → CopyModels → [prod approval] → RegisterModel).
 - [ ] **[Gate]** Manifest bucket in **`mlops-hub`** (`bcnc-manifest-mlops-hub-{env}-{region}` or a shared prefix; name/CMK to SSM; fixed key, `BucketOwnerEnforced`, notifications on).
 - [ ] **[Gate]** Cross-account grants X1–X5.
-- [ ] **[Opt]** `promote_to` flag in the tag contract; IAM-restrict who can set it (Promote Control role only).
-- [ ] **[Opt]** Promote Control (thin UI/CLI/Lambda): writes `promote_to` tag + `PutEvents` custom event.
-- [ ] **[Opt]** EventBridge rule on the custom `PromoteRequested` event (primary); CloudTrail `AddTags`/`UpdateModelPackage` rule as fallback.
-- [ ] **[Opt]** Dev orchestrator Lambda: read `promote_to`, validate, route to the correct target account (stage: dev-gold check; prod: stage-gold gate); idempotent.
+- [ ] **[Core]** Adopt `ModelLifeCycle` as the promotion trigger: training registers with `Stage=Development`; the ML Lead advances `Stage=Staging` / `Stage=Production` from Studio. Verify `ModelLifeCycle` is exposed by the pinned `aws-cdk-lib` / runtime boto3 (GA Nov 2024) before relying on it.
+- [ ] **[Opt]** IAM-restrict `Stage=Production` (and optionally `Stage=Staging`) to the ML Lead role via the `sagemaker:ModelLifeCycle:stage` / `:stageStatus` condition keys.
+- [ ] **[Opt]** EventBridge rule on `SageMaker Model Package State Change` filtered to `detail.UpdatedModelPackageFields` containing `ModelLifeCycle` → orchestrator. (No custom `PutEvents`, no CloudTrail fallback.)
+- [ ] **[Opt]** Dev orchestrator Lambda: read the target from `detail.ModelLifeCycle.Stage`, validate eligibility (`Approved` + `promote` + `candidate_type` + `quality_gate`), route to the correct target account (stage: dev-gold check; prod: stage-gold gate); idempotent.
 - [ ] **[Opt]** Per-model inference branches (release + N shadows) built at synth; release → `results/`, shadow → `shadow-outputs/`.
 - [ ] **[Opt]** Quality gate (advisory first; define thresholds later).
 - [ ] **[Core]** IAM/SCP lockdown of stage/prod registry writes.
@@ -694,10 +694,10 @@ Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate
 | Dev registry = single governance source | All UI in dev; stage and prod promotions query the dev registry |
 | Reconcile enforcement first | `_enforce_catalog_statuses()` rejects non-catalog versions every deploy |
 | Runtime selection, no redeploy | Selection at execution time; infra pipeline runs only for structure changes |
-| Approval blesses, `promote_to` flag moves | `Approved` + `promote=true` (+ quality gate for release) bless; setting `promote_to=stage` then `=prod` is the manual trigger |
-| Promote Control fires the trigger | The control writes `promote_to` and `PutEvents` a custom event → EventBridge → one orchestrator Lambda routes by flag; no per-hop CLI invoke |
-| CloudTrail is the fallback trigger | Tag changes aren't native events; a CloudTrail `AddTags`/`UpdateModelPackage` rule catches out-of-band edits made directly in the registry |
-| Orchestrator idempotent on re-fire | Duplicate trigger events (custom-event re-delivery, or custom primary + CloudTrail fallback both firing) → deterministic manifest + idempotent RegisterModel → no-op |
+| Approval blesses, `ModelLifeCycle` stage moves | `Approved` + `promote=true` (+ quality gate for release) bless; advancing `ModelLifeCycle.Stage=Staging` then `=Production` is the manual trigger |
+| Native lifecycle event fires the trigger | Advancing `ModelLifeCycle.Stage` in Studio emits a native `SageMaker Model Package State Change` event → EventBridge → one orchestrator Lambda routes by `detail.ModelLifeCycle.Stage`; no Promote Control, no `PutEvents`, no per-hop CLI |
+| Lifecycle stage is IAM-gated | `sagemaker:ModelLifeCycle:stage` / `:stageStatus` condition keys restrict who may set `Stage=Production`; the trigger is a first-class field with an audit trail, so no CloudTrail fallback is needed |
+| Orchestrator idempotent on re-fire | Duplicate native events (e.g. a stage re-applied to re-fire) → deterministic manifest + idempotent RegisterModel → no-op |
 | Tag filtering in code | `ListModelPackages` filters by status only |
 | Prod gate precedes the Approved write | Approval before RegisterModel writes Approved |
 | RegisterModel idempotent | Match by source timestamp; update instead of duplicate |
