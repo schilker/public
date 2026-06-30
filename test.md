@@ -1,5 +1,44 @@
 # Registry-First Model Promotion
 
+## Overview — start here
+
+**What this is.** Models are trained in the **dev** AWS account and have to move safely to **stage**, then **prod** — three separate, isolated AWS accounts. This document proposes how an approved model (and its artifact files) should cross those account boundaries under human control, and how inference in each account always serves the latest approved model.
+
+**What "registry-first" means.** Today, promoting a model means editing a static catalog file and redeploying CDK. Registry-first instead makes the **SageMaker Model Registry** the source of truth: a human approves a version in dev and advances its lifecycle stage, and automation copies and re-registers it in the next account — no catalog edit, no redeploy.
+
+**The happy path, end to end:**
+
+1. **Train + register** — the training pipeline registers a new version in the dev registry (`PendingManualApproval`).
+2. **Bless** — the ML Lead marks it `Approved` + `promote=true` in dev Studio. This makes it *eligible* but moves nothing.
+3. **Advance to stage** — the ML Lead sets `ModelLifeCycle.Stage=Staging`. Automation copies the model into the stage account and registers it there; stage inference starts serving it.
+4. **Advance to prod** — the ML Lead sets `Stage=Production`. Same flow, plus one human approval gate before it goes live.
+5. **Serving** — each account's inference picks the latest approved model at its next scheduled run. No redeploy at any step.
+
+> **The one rule to remember:** approval *blesses* a version but moves nothing; advancing its native **`ModelLifeCycle.Stage`** is what triggers promotion — because SageMaker emits an event when that field changes, but not when a tag changes.
+
+## Glossary
+
+| Term | Means |
+|------|-------|
+| **registry-first promotion** | Using the SageMaker Model Registry (not a static catalog file + redeploys) as the source of truth for what to serve. |
+| **dev / stage / prod** | Three *separate, isolated* AWS accounts. Models flow dev → stage → prod; crossing accounts needs explicit grants. |
+| **SageMaker Model Registry** | A per-account catalog of model versions, each with an approval status, a lifecycle stage, and tags. |
+| **Model Package Group / version** | The container for all versions of one model (`{app}-{family}-{model}`); a *version* is one registered training run. |
+| **`ModelApprovalStatus`** | Native field on a version: `Approved` / `Rejected` / `PendingManualApproval`. |
+| **`ModelLifeCycle`** | Native field with a `Stage` (`Development` → `Staging` → `Production`) and `StageStatus`. Advancing the `Stage` is the promotion trigger. |
+| **bless** | The ML Lead's approval (`Approved` + `promote=true`) — makes a version eligible but moves nothing. |
+| **`candidate_type`** | Tag classifying a version: `release` (the served model), `shadow` (runs in parallel, never serves), `test`/`poc` (never deployed). |
+| **release vs shadow** | A family serves 1 **release** model plus N **shadow** models that run for comparison only, never primary traffic. |
+| **eligibility** | The orchestrator's promote condition: `Approved` + `promote=true` + valid `candidate_type` (+ quality gate for release). |
+| **projection** | A read-only stage/prod registry, written only by the promotion pipeline — never hand-edited (enforced by IAM). |
+| **gold bucket** | The S3 bucket holding the served model artifacts (`model.tar.gz`). One per account. |
+| **manifest** | A small JSON file the orchestrator writes telling a target account which version to copy + register. |
+| **orchestrator (Lambda)** | The dev-account Lambda that receives the lifecycle event, checks eligibility, and writes the manifest. |
+| **promotion pipeline** | The per-account CodePipeline that copies the artifact (**CopyModels**) and registers it locally (**RegisterModel**). |
+| **`mlops-hub`** | A separate shared-infrastructure stack that owns the cross-account buckets and keys; imported by name rather than created locally. |
+
+---
+
 > Orange = Human / UI action · Blue = Automated · Green = Storage · Purple = Registry · Teal (dashed) = Net-new component
 
 **Core rule:** A model stays in dev until a human sets `status=Approved` + `promote=true` in the **dev registry**. The dev registry is the single governance source for all environments. Stage and prod registries are projections written only by the promotion pipeline; "read-only" means no human edits, enforced with IAM.
@@ -10,43 +49,43 @@
 
 ---
 
-## Implementation Status — Current vs. Target
+## Current vs. Proposed
 
-| Concern | Current | Target |
+| Concern | Current | Proposed |
 |---------|---------|--------|
-| Inference selection | Container queries the registry at runtime (`batch_inference_processing.py:67-99`) but matches the `MODEL_VERSION` baked at synth from `model_catalog.json` (`sagemaker_inference_pipeline.py:548-592`). | Select latest `Approved`+`release` instead of a pinned version. The `version=None` path already returns latest Approved (`batch_inference_processing.py:78-79`). Stop baking `MODEL_VERSION`; filter tags in code. |
-| Version source of truth | `model_catalog.json` `model_versions.approved[]/pending[]`. | Registry tags + status; catalog holds static topology only. |
-| Per-env registry authority | `ModelRegistryConstruct` runs on every `cdk deploy`; `_enforce_catalog_statuses()` rejects any version not in the catalog (`model_registry_handler.py:244-280`). | RegisterModel step is the writer; remove the enforcement (see "Updating `model_registry_handler.py`"). |
-| Artifact copy | `copy_project` CodeBuild (us-east-1 only) via `sync_models.py` selective per-version copy. | Reused by the new Model Promotion Pipeline. |
-| Shared buckets (gold/silver/ephemeral) | This repo creates gold/silver in `artifact_bucket_stack.py`. | Owned by **`mlops-hub`** (`bcnc-{tier}-mlops-hub-{env}-{region}`, names/CMKs in SSM); this repo imports via `from_bucket_name`. Silver eliminated; manifest bucket added in `mlops-hub`. |
+| Inference selection | The inference container queries the registry at runtime but matches a `MODEL_VERSION` pinned at synth time from a static catalog. | Select latest `Approved`+`release` instead of a pinned version. A "latest Approved" query path typically already exists; stop baking `MODEL_VERSION` and filter tags in code. |
+| Version source of truth | A static catalog file lists approved/pending versions per model. | Registry tags + status; the catalog holds static topology only. |
+| Per-env registry authority | A registry-sync construct runs on every `cdk deploy` and rejects any registry version not listed in the catalog. | The RegisterModel step is the writer; remove the catalog enforcement (see "Reconciling the registry-sync Lambda"). |
+| Artifact copy | An existing CodeBuild project (us-east-1 only) does selective per-version artifact copies. | Reused by the new Model Promotion Pipeline. |
+| Shared buckets (gold/silver/ephemeral) | Gold/silver buckets are created locally today. | Owned by **`mlops-hub`** (`bcnc-{tier}-mlops-hub-{env}-{region}`, names/CMKs in SSM); imported via `from_bucket_name`. Silver eliminated; manifest bucket added in `mlops-hub`. |
 | `ModelLifeCycle` stage transitions as the promotion trigger, EventBridge rule, orchestrator, manifest bucket, S3-source pipeline, RegisterModel, shadow inference branches | None exist. | All net-new (the trigger is the native `ModelLifeCycle` event — no custom Promote Control or `PutEvents`). |
 
-A `Type:Lambda` step is expressible in the raw `CfnPipeline` JSON, so runtime selection does not require an SDK migration; the cheapest path is container-side selection plus removing the synth-time version pin.
+A `Type: Lambda` step is expressible in the raw SageMaker pipeline (CloudFormation) JSON, so runtime selection does not require an SDK migration; the cheapest path is container-side selection plus removing the synth-time version pin.
 
 ---
 
-## Updating `model_registry_handler.py` (one gotcha to avoid)
+## Reconciling the registry-sync Lambda (one gotcha to avoid)
 
-**Purpose of this note:** updating this Lambda is just part of the migration — but there's one non-obvious way to get it *partly* right that silently breaks promotion, so it's called out here.
+**Purpose of this note:** today, a Lambda syncs the registry from a static catalog on every deploy. Reconciling it is just part of this proposal — but there's one non-obvious way to get it *partly* right that silently breaks promotion, so it's called out here.
 
-**Today**, `model_registry_handler.py` keeps the registry in sync with `model_catalog.json`, and `_enforce_catalog_statuses()` **Rejects any registry version not listed in the catalog — on every `cdk deploy`**. Registry-first promotion deliberately registers versions that are *not* in the catalog. So if that Reject behavior survives your rewrite, the **next unrelated `cdk deploy` silently flips your promoted models to `Rejected`** and inference stops finding them.
+**Today**, the registry-sync Lambda keeps the registry in step with a static catalog, and its catalog-enforcement logic **Rejects any registry version not listed in the catalog — on every `cdk deploy`**. Registry-first promotion deliberately registers versions that are *not* in the catalog. So if that Reject behavior survives your rewrite, the **next unrelated `cdk deploy` silently flips your promoted models to `Rejected`** and inference stops finding them.
 
 **The change to make:**
 
 | Keep | Remove |
 |------|--------|
-| Model Package Group creation | The catalog version-sync (`approved[0]`/`pending[]` → registry) |
-| | `_enforce_catalog_statuses()` — the Reject-on-not-in-catalog behavior |
+| Model Package Group creation | The catalog version-sync (catalog `approved[]`/`pending[]` → registry) |
+| | The catalog-enforcement logic — the Reject-on-not-in-catalog behavior |
 
-After this, **RegisterModel is the sole status authority**. Do **not** retain catalog status enforcement — note the original Files-Affected guidance said *"retain tag enforcement,"* which would reintroduce exactly this bug.
+After this, **RegisterModel is the sole status authority**. Do **not** retain catalog status enforcement — it would reintroduce exactly this bug.
 
-> Clean cutover (recommended): remove it outright. If instead you migrate **family-by-family**, temporarily scope `_enforce_catalog_statuses()` to ignore versions tagged `promoted_by=reconciler` during the transition, then remove it once all families are migrated.
+> Clean cutover (recommended): remove it outright. If instead you migrate **family-by-family**, temporarily scope the enforcement to ignore versions tagged `promoted_by=reconciler` during the transition, then remove it once all families are migrated.
 
 ---
 
 ## Metadata Contract — what's set, where it lives, by whom
 
-All governance state lives on the **model package version** in the SageMaker Model Registry — not in `model_catalog.json`. One Model Package Group per `{app}-{family}-{model}`; one version per training run; tags/status attach to each version.
+All governance state lives on the **model package version** in the SageMaker Model Registry — not in a static catalog file. One Model Package Group per `{app}-{family}-{model}`; one version per training run; tags/status attach to each version.
 
 **Three storage slots on a version:**
 
@@ -54,7 +93,9 @@ All governance state lives on the **model package version** in the SageMaker Mod
 |-------|---------|---------|
 | `ModelApprovalStatus` (Approved / Rejected / Pending) | Native first-class field | `UpdateModelPackage`, or the Studio Model Registry "Update status" button |
 | `ModelLifeCycle` (`Stage` + `StageStatus`) — the promotion **trigger** | Native first-class field (both required strings, ≤63 chars) | `UpdateModelPackage` / `CreateModelPackage`, or the Studio "Update model lifecycle" action |
-| `carepath:promote`, `candidate_type`, `quality_gate_passed`, `version`, `git_sha`, `data_snapshot` — governance **eligibility** + lineage | Resource **tags** (governance flags) or `CustomerMetadataProperties` (lineage) | `AddTags` / `UpdateModelPackage` — by training automation or the ML Lead's bless |
+| `promote`, `candidate_type`, `quality_gate_passed`, `version`, `git_sha`, `data_snapshot` — governance **eligibility** + lineage | Resource **tags** (governance flags) or `CustomerMetadataProperties` (lineage) | `AddTags` / `UpdateModelPackage` — by training automation or the ML Lead's bless |
+
+> Tag keys are shown unprefixed for readability. If your account's registry is shared across applications, namespace them per app (e.g. `<app>:promote`) so each app's governance tags stay distinct.
 
 **Who sets what:**
 
@@ -166,13 +207,13 @@ The prod Manual Approval runs before RegisterModel writes `Approved`, so a sched
 
 - **Promotion manifest** = a small JSON file the dev orchestrator writes to the **manifest bucket** (one per target env). It is the *instruction* for a single promotion. Shape:
   ```json
-  { "family": "h2h_commercial", "model": "ccm_readm", "version": "20260416_2253",
+  { "family": "fraud", "model": "txn_scorer", "version": "20260416_2253",
     "candidate_type": "release", "source_gold": "s3://bcnc-gold-mlops-hub-dev-us-east-1/...",
     "target_gold": "s3://bcnc-gold-mlops-hub-stage-us-east-1/..." }
   ```
 - **S3 Source** = the Model Promotion CodePipeline's **first action** (a CodePipeline source of type S3). It *watches* that one manifest object at a **fixed S3 key** and **auto-starts the pipeline** whenever the object changes.
 
-So the bucket/JSON is the *what to promote*; the S3 Source is the *trigger that reacts to it*. This is why the new pipeline is **S3-triggered**, in contrast to the Infra CD pipeline, which is **GitHub-triggered** (`GitHub_Source`). Nothing in the repo uses an S3-triggered pipeline today, so both the manifest bucket and the S3-source pipeline are net-new. (Because the source is one fixed key, the manifest content must change per promotion — e.g. include the version — or the source won't re-trigger; see Failure Modes.)
+So the bucket/JSON is the *what to promote*; the S3 Source is the *trigger that reacts to it*. This is why the new pipeline is **S3-triggered**, in contrast to the Infra CD pipeline, which is **GitHub-triggered** (`GitHub_Source`). No pipeline is S3-triggered today, so both the manifest bucket and the S3-source pipeline are net-new. (Because the source is one fixed key, the manifest content must change per promotion — e.g. include the version — or the source won't re-trigger; see Failure Modes.)
 
 ---
 
@@ -216,11 +257,11 @@ flowchart TD
 
 ---
 
-## Diagram 3 — CDPipelineStack deploys TWO sibling CodePipelines (per account)
+## Diagram 3 — The CD stack deploys TWO sibling CodePipelines (per account)
 
-**One `CDPipelineStack` per env creates two separate AWS CodePipelines as sibling constructs** — not one pipeline, and neither is deployed *by* the other. They live in the same stack so the new one can reuse the existing `copy_project` CodeBuild project, `copy_service_role`, `cloudformation_role`, and `artifacts_bucket`.
+**One CD pipeline stack per env creates two separate AWS CodePipelines as sibling constructs** — not one pipeline, and neither is deployed *by* the other. They live in the same stack so the new one can reuse the existing copy CodeBuild project, its copy service role, the CloudFormation deploy role, and the CodePipeline artifacts bucket.
 
-- **Pipeline #1 — Infra CD CodePipeline** (existing): Git-triggered; its Deploy stage deploys the three app stacks (bucket, CarePath, PR-CI). The CarePath app stack is where the SageMaker pipelines and `ModelRegistryConstruct` actually live — there is no separate "model registry stack."
+- **Pipeline #1 — Infra CD CodePipeline** (existing): Git-triggered; its Deploy stage deploys the application's stacks — typically a data-bucket stack, the **application stack** (where the SageMaker pipelines and the registry-sync construct live), and a CI stack. There is no separate "model registry stack."
 - **Pipeline #2 — Model Promotion CodePipeline** (new): manifest-S3-triggered; a CodePipeline that *uses* a CodeBuild action for the copy. It moves + registers model artifacts. It does **not** deploy stacks.
 
 ```mermaid
@@ -231,14 +272,14 @@ flowchart TD
     classDef shared fill:#00695c,stroke:#004d40,color:#fff
     classDef new    fill:#00838f,stroke:#006064,color:#fff,stroke-dasharray: 4 3
 
-    subgraph STACK["CDPipelineStack  (one per env / account)  →  creates 2 CodePipelines"]
+    subgraph STACK["CD pipeline stack  (one per env / account)  →  creates 2 CodePipelines"]
         direction TB
         subgraph INFRA["① Infra CD CodePipeline  (Git triggered)"]
             direction LR
             I1["Source\nGitHub push"]
             I2["CDK Synth"]
             I3["PublishAssets"]
-            I4["Deploy stage\n→ Bucket · CarePath · PR-CI stacks"]
+            I4["Deploy stage\n→ app stacks (bucket · app · CI)"]
             I1 --> I2 --> I3 --> I4
         end
         subgraph MODELPIPE["② Model Promotion CodePipeline  (manifest triggered)"]
@@ -249,7 +290,7 @@ flowchart TD
             M3["RegisterModel\nLambda · idempotent · sets Approved"]
             M1 --> M2 --> M4 --> M3
         end
-        SHARED["Shared, reused by BOTH (per env)\ncopy_project CodeBuild — us-east-1 only\ncopy_service_role (fixed name)\ncloudformation_role\nartifacts_bucket (CodePipeline store)"]
+        SHARED["Shared, reused by BOTH (per env)\ncopy CodeBuild project — us-east-1 only\ncopy service role (fixed name)\nCloudFormation deploy role\nCodePipeline artifacts bucket"]
     end
 
     INFRA -. "reuses" .-> SHARED
@@ -263,7 +304,7 @@ flowchart TD
     class SHARED shared
 ```
 
-> **What deploys what:** `cdk deploy CDPipelineStack` creates *both* pipelines. Pipeline #1's Deploy stage then deploys the three **app stacks** (bucket, CarePath, PR-CI). Pipeline #2 never deploys a stack — it copies the artifact and registers the model. The Model Promotion CodePipeline only exists where promotions land (dev as source, stage/prod as targets), and its copy step inherits the **us-east-1-only** constraint of `copy_project`.
+> **What deploys what:** deploying the CD pipeline stack creates *both* pipelines. Pipeline #1's Deploy stage then deploys the application's **app stacks** (data-bucket, app, CI). Pipeline #2 never deploys a stack — it copies the artifact and registers the model. The Model Promotion CodePipeline only exists where promotions land (dev as source, stage/prod as targets), and its copy step inherits the **us-east-1-only** constraint of the copy CodeBuild project.
 
 ---
 
@@ -348,7 +389,7 @@ flowchart TD
 
 ---
 
-## Diagram 6 — Inference Execution (mirrors `sagemaker_inference_pipeline.py`, scaled to N shadows)
+## Diagram 6 — Inference Execution (scaled to N shadows)
 
 The pipeline is a single SageMaker `CfnPipeline` whose steps are **all `Type: Processing`**, wired by `DependsOn`: one `Preprocessing_{family}` step → a feature-engineering layer (a shared `FE_{family}` for shared-vocab models, plus a dedicated `FE_{model}` for any own-vocab model) → one `Inference_{model}` step per model. Scaling to N shadows means the family's model list is **1 release + N shadow entries**, so the synth loop emits **N+1 inference branches** off the shared preprocessing/FE.
 
@@ -364,7 +405,7 @@ flowchart TD
 
     SCHED["Scheduled / on-demand execution\nCfnPipeline · every step Type: Processing"]
 
-    subgraph PIPE["Inference Pipeline (one per chaselist family, per env)"]
+    subgraph PIPE["Inference Pipeline (one per model family, per env)"]
         direction TB
 
         PP["Preprocessing_{family}\nProcessing · fetch + prep data\noutput: preprocessing_data"]
@@ -413,16 +454,16 @@ flowchart TD
     class LOCALREG reg
 ```
 
-**How it maps to the code** (`sagemaker_inference_pipeline.py`):
+**How each step is built:**
 
-| Diagram | Code |
-|---------|------|
-| `Preprocessing_{family}` | `pp_step_name = Preprocessing_{family}`, `Type: Processing`, output `preprocessing_data` |
-| `FE_{family}` (shared) | `shared_fe_step_name = FE_{family}`, `DependsOn: [pp_step_name]`; feeds every shared-vocab model |
-| `FE_{shadow_N}` (own-vocab) | per-model `fe_step_name` for models where `has_vocab and not is_legacy` |
-| `Inference_{model}` | per-model `inference_step_name`, `DependsOn: [fe_step_name]` |
-| release vs shadow **(target)** | net-new — no equivalent today. Current code routes *all* inference output to `scores/{family}/{model}/{version}/` (`sagemaker_inference_pipeline.py:962-965`) with no `candidate_type` tag and no release/shadow split. Target: select on the model's `candidate_type` tag and route release → `results/`, shadow → `shadow-outputs/`. |
-| model version | container resolves it at runtime via `list_model_packages` + `describe_model_package` (`batch_inference_processing.py`) |
+| Step | Implementation |
+|------|----------------|
+| `Preprocessing_{family}` | One `Type: Processing` step per family; output `preprocessing_data`. |
+| `FE_{family}` (shared) | One shared feature-engineering step, `DependsOn` preprocessing; feeds every shared-vocab model. |
+| `FE_{model}` (own-vocab) | A dedicated FE step per model that has its own vocabulary (and isn't legacy). |
+| `Inference_{model}` | One inference step per model, `DependsOn` its FE step. |
+| release vs shadow **(target)** | net-new — no equivalent today. Current code routes *all* inference output to a single `scores/{family}/{model}/{version}/` path with no `candidate_type` split. Target: select on the model's `candidate_type` and route release → `results/`, shadow → `shadow-outputs/`. |
+| model version | The container resolves it at runtime via `ListModelPackages` + `DescribeModelPackage`. |
 
 | Behaviour | Detail |
 |-----------|--------|
@@ -447,9 +488,9 @@ The default state of every model; it stays here until tags explicitly enable pro
 | Tag | Value |
 |-----|-------|
 | `ModelApprovalStatus` | `PendingManualApproval` |
-| `carepath:promote` | `false` |
-| `carepath:quality_gate_passed` | `false` |
-| `carepath:candidate_type` | `release` (default) |
+| `promote` | `false` |
+| `quality_gate_passed` | `false` |
+| `candidate_type` | `release` (default) |
 
 Not eligible: still `Stage=Development`, and even if advanced the orchestrator rejects it (not Approved, promote=false, quality_gate=false).
 
@@ -458,9 +499,9 @@ Not eligible: still `Stage=Development`, and even if advanced the orchestrator r
 | Tag | Value |
 |-----|-------|
 | `ModelApprovalStatus` | `PendingManualApproval` |
-| `carepath:promote` | `false` |
-| `carepath:quality_gate_passed` | `true` |
-| `carepath:candidate_type` | `release` |
+| `promote` | `false` |
+| `quality_gate_passed` | `true` |
+| `candidate_type` | `release` |
 
 Not eligible (promote=false, status still Pending). Human review now available.
 
@@ -469,9 +510,9 @@ Not eligible (promote=false, status still Pending). Human review now available.
 | Tag | Value |
 |-----|-------|
 | `ModelApprovalStatus` | `Rejected` |
-| `carepath:promote` | `false` |
-| `carepath:quality_gate_passed` | `true` or `false` |
-| `carepath:candidate_type` | `release` |
+| `promote` | `false` |
+| `quality_gate_passed` | `true` or `false` |
+| `candidate_type` | `release` |
 
 Rejected — permanently excluded from all orchestrator queries.
 
@@ -480,9 +521,9 @@ Rejected — permanently excluded from all orchestrator queries.
 | Tag | Value |
 |-----|-------|
 | `ModelApprovalStatus` | `PendingManualApproval` |
-| `carepath:promote` | `false` |
-| `carepath:quality_gate_passed` | `true` or `false` |
-| `carepath:candidate_type` | `test` or `poc` |
+| `promote` | `false` |
+| `quality_gate_passed` | `true` or `false` |
+| `candidate_type` | `test` or `poc` |
 
 Not eligible (promote=false, candidate_type=test/poc); the orchestrator filters it out even if the stage is advanced.
 
@@ -495,9 +536,9 @@ Approval blesses the version; setting `ModelLifeCycle.Stage=Staging` triggers th
 | Tag | Value |
 |-----|-------|
 | `ModelApprovalStatus` | `Approved`  ← key change |
-| `carepath:promote` | `true`  ← key change |
-| `carepath:quality_gate_passed` | `true` (required for release) |
-| `carepath:candidate_type` | `release` |
+| `promote` | `true`  ← key change |
+| `quality_gate_passed` | `true` (required for release) |
+| `candidate_type` | `release` |
 
 Approval blesses the version (no movement). The human advances `ModelLifeCycle.Stage=Staging` in Studio → native event (`UpdatedModelPackageFields=["ModelLifeCycle"]`, `Stage=Staging`) → EventBridge → orchestrator validates the version (`Approved` + `promote=true` + `candidate_type=release` + `quality_gate=true`) → writes the stage manifest → stage pipeline runs (CopyModels → RegisterModel sets `Approved`, idempotent).
 
@@ -506,9 +547,9 @@ Approval blesses the version (no movement). The human advances `ModelLifeCycle.S
 | Tag | Value |
 |-----|-------|
 | `ModelApprovalStatus` | `Approved` |
-| `carepath:promote` | `true` |
-| `carepath:quality_gate_passed` | `true` or `false` (not required) |
-| `carepath:candidate_type` | `shadow` |
+| `promote` | `true` |
+| `quality_gate_passed` | `true` or `false` (not required) |
+| `candidate_type` | `shadow` |
 
 Set `ModelLifeCycle.Stage=Staging`; orchestrator match: promote=true + Approved + candidate_type=shadow (quality gate not checked). Stage manifest carries `candidate_type=shadow` → stage wires it as a shadow slot (serves only `shadow-outputs/`, never primary traffic).
 
@@ -611,21 +652,21 @@ Never hand-edit the stage/prod registry.
 
 ### Shared storage is owned by `mlops-hub`
 
-The shared `gold` / `ephemeral` buckets and their CMKs are **not created by this repo** — they are created by **`mlops-hub`** (the shared data-lake stack, `stacks/s3_stack.py`), one per account/region (silver is eliminated; see Implementation Status):
+The shared `gold` / `ephemeral` buckets and their CMKs are **not created locally** — they are created by **`mlops-hub`** (the shared data-lake stack), one per account/region (silver is eliminated; see Current vs. Proposed):
 
 - **Naming:** `bcnc-{tier}-mlops-hub-{env}-{region}` — e.g. gold is `bcnc-gold-mlops-hub-{env}-{region}` (`env` ∈ dev/stage/prod, `region` ∈ us-east-1/us-east-2).
-- **Discovery:** names exported to SSM (`/{project}/s3/{tier}/name`); CMK ARNs exported to SSM too. This repo imports them via `s3.Bucket.from_bucket_name(...)` after an SSM lookup.
+- **Discovery:** names exported to SSM (`/{project}/s3/{tier}/name`); CMK ARNs exported to SSM too. Imported via `s3.Bucket.from_bucket_name(...)` after an SSM lookup.
 - **Existing trust:** `mlops-hub` bucket + KMS policies already trust roles matching `*-SageMaker-*` (training writes the versioned artifact to gold) and `*-CopyModels-*` (gold promotion).
 
-**Consequence:** every new cross-account grant below must be added **in `mlops-hub`** (this repo cannot attach policies to imported `IBucket`s), and the new roles should either match an existing trusted pattern or `mlops-hub` must add the pattern. The **promotion manifest bucket** should be created the same way — a new `mlops-hub` tier (e.g. `bcnc-manifest-mlops-hub-{env}-{region}`) or a dedicated prefix on an existing shared bucket — with its name/CMK in SSM.
+**Consequence:** every new cross-account grant below must be added **in `mlops-hub`** (policies cannot be attached to imported `IBucket`s), and the new roles should either match an existing trusted pattern or `mlops-hub` must add the pattern. The **promotion manifest bucket** should be created the same way — a new `mlops-hub` tier (e.g. `bcnc-manifest-mlops-hub-{env}-{region}`) or a dedicated prefix on an existing shared bucket — with its name/CMK in SSM.
 
 | # | Grant | Reason | Owner |
 |---|-------|--------|-------|
 | X1 | Manifest bucket policy → dev orchestrator role `s3:PutObject` (+ `PutObjectTagging`, `AbortMultipartUpload`) | Cross-account write needs a target resource policy | **`mlops-hub`** (manifest bucket) — role should match `*-CopyModels-*` or a new trusted pattern |
-| X2 | Manifest object ownership = `BucketOwnerEnforced` | Otherwise target pipeline cannot read dev-written objects | **`mlops-hub`** (`s3_stack.py`) |
+| X2 | Manifest object ownership = `BucketOwnerEnforced` | Otherwise target pipeline cannot read dev-written objects | **`mlops-hub`** (its S3 stack) |
 | X3 | Manifest CMK policy → dev orchestrator role `GenerateDataKey`/`Encrypt` | SSE-KMS cross-account write | **`mlops-hub`** (CMK exported to SSM) |
 | X4 | `bcnc-gold-mlops-hub-stage-{region}` bucket + CMK → dev orchestrator role `GetObject`/`ListBucket`/`Decrypt` | Forward-only HeadObject gate is a dev→stage read not in today's trust (gold trusts `*-CopyModels-*` for promotion, not a dev reader) | **`mlops-hub`** (stage gold bucket + CMK policy) |
-| X5 | Preserve `copy_service_role` name (`*-CopyModels-*`) so the existing `mlops-hub` gold trust keeps working | Cross-account copy trust is keyed on the role-name pattern | This repo (`cd_pipeline_stack.py`) |
+| X5 | Preserve the copy service role's name (`*-CopyModels-*`) so the existing `mlops-hub` gold trust keeps working | Cross-account copy trust is keyed on the role-name pattern | CD pipeline stack |
 
 ---
 
@@ -637,10 +678,10 @@ Most of the net-new apparatus is a *choice*, not a requirement. Build it in tier
 
 | Piece | Why essential |
 |-------|---------------|
-| **CopyModels** (artifact → target gold) | Inference reads the *local* gold bucket; the bytes must physically get there. Reuses existing `copy_project`. |
+| **CopyModels** (artifact → target gold) | Inference reads the *local* gold bucket; the bytes must physically get there. Reuses the existing copy CodeBuild project. |
 | **RegisterModel** (Approved entry in target registry) | Inference selects from the *local* registry; something must write the Approved version locally. |
 | **Runtime selection** (stop baking `MODEL_VERSION`) | This *is* registry-first. Keep baking the version and you don't need any of this — just edit the catalog and redeploy (today's system). |
-| **Reconcile `ModelRegistryConstruct`** | Otherwise the enforcement Lambda Rejects promoted versions on the next deploy. Non-negotiable. |
+| **Reconcile the registry-sync construct** | Otherwise the enforcement Lambda Rejects promoted versions on the next deploy. Non-negotiable. |
 
 **Leanest working version:** human approves in dev → trigger the promotion (manually) → CopyModels → RegisterModel; plus stop baking `MODEL_VERSION` and neuter the enforcement Lambda. That's a complete registry-first promotion.
 
@@ -668,10 +709,10 @@ Most of the net-new apparatus is a *choice*, not a requirement. Build it in tier
 
 Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate), **[Opt]** = Tier 3.
 
-- [ ] **[Core]** Rewrite `model_registry_handler.py`: **keep** Model Package Group creation; **remove** the catalog version-sync AND `_enforce_catalog_statuses()` (the Reject-on-not-in-catalog behavior). RegisterModel becomes sole status authority — do not retain catalog status enforcement.
+- [ ] **[Core]** Rewrite the registry-sync Lambda: **keep** Model Package Group creation; **remove** the catalog version-sync AND the catalog-enforcement logic (the Reject-on-not-in-catalog behavior). RegisterModel becomes sole status authority — do not retain catalog status enforcement.
 - [ ] **[Core]** Stop baking `MODEL_VERSION`; select latest `Approved`+`release` (tag filter in code).
 - [ ] **[Core]** RegisterModel Lambda (local, idempotent, sets Approved).
-- [ ] **[Core]** CopyModels — reuse `copy_project` (us-east-1) to copy artifact into target gold.
+- [ ] **[Core]** CopyModels — reuse the existing copy CodeBuild project (us-east-1) to copy artifact into target gold.
 - [ ] **[Gate]** Model Promotion CodePipeline (S3 source → CopyModels → [prod approval] → RegisterModel).
 - [ ] **[Gate]** Manifest bucket in **`mlops-hub`** (`bcnc-manifest-mlops-hub-{env}-{region}` or a shared prefix; name/CMK to SSM; fixed key, `BucketOwnerEnforced`, notifications on).
 - [ ] **[Gate]** Cross-account grants X1–X5.
@@ -692,7 +733,7 @@ Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate
 | Rule | Detail |
 |------|--------|
 | Dev registry = single governance source | All UI in dev; stage and prod promotions query the dev registry |
-| Reconcile enforcement first | `_enforce_catalog_statuses()` rejects non-catalog versions every deploy |
+| Reconcile enforcement first | The registry-sync Lambda's catalog enforcement rejects non-catalog versions every deploy |
 | Runtime selection, no redeploy | Selection at execution time; infra pipeline runs only for structure changes |
 | Approval blesses, `ModelLifeCycle` stage moves | `Approved` + `promote=true` (+ quality gate for release) bless; advancing `ModelLifeCycle.Stage=Staging` then `=Production` is the manual trigger |
 | Native lifecycle event fires the trigger | Advancing `ModelLifeCycle.Stage` in Studio emits a native `SageMaker Model Package State Change` event → EventBridge → one orchestrator Lambda routes by `detail.ModelLifeCycle.Stage`; no Promote Control, no `PutEvents`, no per-hop CLI |
@@ -703,12 +744,12 @@ Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate
 | RegisterModel idempotent | Match by source timestamp; update instead of duplicate |
 | Registry writes IAM-locked | Only RegisterModel role may write stage/prod |
 | Forward-only gate = stage-gold HeadObject | Checks artifact presence; needs grant X4; transient 403/404 retryable |
-| Shared buckets owned by `mlops-hub` | gold/ephemeral + the manifest bucket are created by `mlops-hub` (`bcnc-{tier}-mlops-hub-{env}-{region}`, names/CMKs in SSM), imported here via `from_bucket_name()` — so all cross-account grants (X1–X4) are added in `mlops-hub`, not this repo |
+| Shared buckets owned by `mlops-hub` | gold/ephemeral + the manifest bucket are created by `mlops-hub` (`bcnc-{tier}-mlops-hub-{env}-{region}`, names/CMKs in SSM), imported via `from_bucket_name()` — so all cross-account grants (X1–X4) are added in `mlops-hub`, not locally |
 | Cross-account write needs ownership + KMS | BucketOwnerEnforced + bucket policy + KMS grant (X1–X3) |
 | Lambda never blocks | Writes manifest and exits; CodePipeline owns waits |
 | Approval gate 7-day expiry | Un-actioned prod promotions fail |
-| `CDPipelineStack` = two sibling CodePipelines | One stack creates both the Infra CD pipeline (Git → deploys bucket/CarePath/PR-CI stacks) and the Model Promotion pipeline (manifest → copy + register); neither deploys the other; both reuse `copy_project`/`copy_service_role` |
-| Copy = CodeBuild (us-east-1 only) | Reuses `copy_project`; preserve role name (X5) |
+| CD stack = two sibling CodePipelines | One stack creates both the Infra CD pipeline (Git → deploys the app stacks) and the Model Promotion pipeline (manifest → copy + register); neither deploys the other; both reuse the copy CodeBuild project / copy service role |
+| Copy = CodeBuild (us-east-1 only) | Reuses the copy CodeBuild project; preserve role name (X5) |
 | Shadows are synth-time inference branches | 1 release + N shadow `Inference_{model}` Processing steps off shared preprocessing/FE; changing N needs a re-synth/upsert; changing a version does not |
 | Lifecycle defined | Keep last N / referenced versions per model |
-| Change `sync_models.py` | Read the version from the manifest |
+| Copy step reads the version | The copy step reads which version to promote from the manifest |
