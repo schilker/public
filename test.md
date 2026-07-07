@@ -10,7 +10,7 @@
 
 1. **Train + register** — the training pipeline trains + evaluates a model and (if it clears a `ConditionStep` gate on the training step's **existing model-quality output**) a `ModelStep` registers the new version in the dev registry (`PendingManualApproval`), referencing the artifact it wrote to dev gold. The Model Registry is the source of truth — no `model_catalog.json`. *(See "How a version enters the dev registry" below.)*
 2. **Bless** — the ML Lead marks it `Approved` in dev Studio. This makes it *eligible* but moves nothing.
-3. **Advance to stage** — the ML Lead sets `ModelLifeCycle.Stage=Staging` and `StageStatus=Release` (the deployment role) in one action. Automation copies the model into the stage account and registers it there; stage inference starts serving it.
+3. **Advance to stage** — in one action the ML Lead sets `ModelLifeCycle.Stage=Staging` **and** the deployment role `StageStatus` — either **`Release`** (the primary model, served) or **`Shadow`** (registered and scored offline for comparison, never served). Automation copies the model into the stage account and registers it there *with that role*. Stage inference serves the latest `Release`; a group can hold **one `Release` plus any number of `Shadow`s**, which coexist (a new `Release` retires the prior `Release`, but never a `Shadow`).
 4. **Advance to prod** — the ML Lead sets `Stage=Production`. Same flow, plus one human approval gate before it goes live.
 5. **Serving** — each account's inference picks the latest approved model at its next scheduled run. No redeploy at any step.
 
@@ -141,7 +141,7 @@ flowchart TD
         APPROVE -- "UpdateModelPackage (status)" --> DEVREG
 
         PROMOTE(["[UI] ML Lead — Update model lifecycle\nStage=Staging → Production +\nStageStatus=Release / Shadow\n(one native Studio action)"])
-        EB["EventBridge Rules (2)\nModel Package State Change\nscoped: ModelPackageGroupName prefix={app}-\n(1) UpdatedModelPackageFields=[ModelLifeCycle] → promote\n(2) ModelApprovalStatus=Rejected → de-promote"]
+        EB["EventBridge Rules (2)\nModel Package State Change\nscoped: ModelPackageGroupName prefix={app}-\n(1) UpdatedModelPackageFields=[ModelLifeCycle] → promote / retire\n(2) ModelApprovalStatus=Rejected → de-promote"]
         EVQ["SQS event queue (+ DLQ)\nbatch window coalesces a burst"]
         ORCH["Dev Orchestrator Lambda\nbatched: validate eligibility,\nwrite ONE manifest per env (items[])\nprod: HeadObject stage-gold gate"]
 
@@ -154,19 +154,21 @@ flowchart TD
 
     subgraph STAGE["☁️  STAGE ACCOUNT"]
         direction TB
-        STAGEMAN[("Stage Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-stage-{region}\nfixed key · versioned · BucketOwnerEnforced")]
+        STAGEMAN[("Stage Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-stage-{region}\nlatest.json=promote · depromote-latest.json=reject/retire\nversioned · BucketOwnerEnforced")]
         STAGESTART["events.Rule (Object Created)\n→ starter Lambda\nStartPipelineExecution (pins object version)"]
         subgraph SP["Model Promotion Pipeline (QUEUED)"]
             direction LR
             SS1["S3 Source (trigger=NONE)\nfetches that object version"]
             SS2["CopyModels\ngold(dev)→gold(stage)"]
-            SS3["RegisterModel\nlocal · sets Approved · idempotent"]
+            SS3["RegisterModel\nlocal · sets Approved+role · idempotent\nrole=Release retires prior Release"]
             SS1 --> SS2 --> SS3
         end
         STAGEGOLD[("Stage Gold Bucket (mlops-hub)\nbcnc-gold-mlops-hub-stage-{region}")]
         STAGEREG[["Stage Registry\nprojection · IAM-locked"]]
         STAGEINF["Stage Inference\nselects Approved + StageStatus=Release\nat execution time"]
-        STAGEMAN -- "Object Created" --> STAGESTART -- "start (pinned)" --> SS1
+        STAGEFAST["events.Rule (depromote-latest.json)\n→ Fast-path Lambda · reject/retire\napplies directly · no pipeline"]
+        STAGEMAN -- "latest.json · Object Created" --> STAGESTART -- "start (pinned)" --> SS1
+        STAGEMAN -- "depromote-latest.json" --> STAGEFAST -- "apply directly" --> STAGEREG
         SS2 --> STAGEGOLD
         SS3 --> STAGEREG
         STAGEREG -. "runtime query" .-> STAGEINF
@@ -175,20 +177,22 @@ flowchart TD
 
     subgraph PROD["☁️  PROD ACCOUNT"]
         direction TB
-        PRODMAN[("Prod Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-prod-{region}\nfixed key · versioned · BucketOwnerEnforced")]
+        PRODMAN[("Prod Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-prod-{region}\nlatest.json=promote · depromote-latest.json=reject/retire\nversioned · BucketOwnerEnforced")]
         PRODSTART["events.Rule (Object Created)\n→ starter Lambda\nStartPipelineExecution (pins object version)"]
         subgraph PP["Model Promotion Pipeline (QUEUED)"]
             direction LR
             PP1["S3 Source (trigger=NONE)\nfetches that object version"]
             PP2["CopyModels\ngold(stage)→gold(prod)"]
             PP4(["[UI] Manual Approval\n7-day expiry"])
-            PP3["RegisterModel\nsets Approved AFTER gate"]
+            PP3["RegisterModel\nsets Approved+role AFTER gate\nrole=Release retires prior Release"]
             PP1 --> PP2 --> PP4 --> PP3
         end
         PRODGOLD[("Prod Gold Bucket (mlops-hub)\nbcnc-gold-mlops-hub-prod-{region}\nunserved until RegisterModel")]
         PRODREG[["Prod Registry\nprojection · IAM-locked"]]
         PRODINF["Prod Inference\nselects Approved + StageStatus=Release\nat execution time"]
-        PRODMAN -- "Object Created" --> PRODSTART -- "start (pinned)" --> PP1
+        PRODFAST["events.Rule (depromote-latest.json)\n→ Fast-path Lambda · reject/retire\napplies directly · no pipeline · no approval"]
+        PRODMAN -- "latest.json · Object Created" --> PRODSTART -- "start (pinned)" --> PP1
+        PRODMAN -- "depromote-latest.json" --> PRODFAST -- "apply directly" --> PRODREG
         PP2 --> PRODGOLD
         PP3 --> PRODREG
         PRODREG -. "runtime query" .-> PRODINF
@@ -200,7 +204,7 @@ flowchart TD
 
     class APPROVE,PROMOTE,PP4 human
     class TRAIN,QG,SS2,PP2,STAGEINF,PRODINF auto
-    class EB,EVQ,ORCH,STAGESTART,PRODSTART,SS1,SS3,PP1,PP3,STAGEMAN,PRODMAN new
+    class EB,EVQ,ORCH,STAGESTART,PRODSTART,STAGEFAST,PRODFAST,SS1,SS3,PP1,PP3,STAGEMAN,PRODMAN new
     class DEVGOLD,STAGEGOLD,PRODGOLD store
     class DEVREG,STAGEREG,PRODREG reg
 ```
@@ -268,6 +272,7 @@ flowchart LR
     ] }
   ```
   Manifest-level: `target_stage` sets each projection version's `ModelLifeCycle.Stage`. Per item: `role` sets its `StageStatus`, `promotion_id`/`version` drive RegisterModel idempotency. A single-item batch is still one `items[]` entry.
+- **De-projection manifest (reject / retire)** = the same orchestrator writes these to a **separate key**, `manifests/{app}/depromote-latest.json`, with `action: "deproject"` and each item carrying a `kind` (`reject` | `retire`). This key triggers a **fast-path Lambda directly — no CodePipeline, no CopyModels, no prod approval** — because a break-glass reject must apply immediately, not wait behind the 7-day prod gate. (`reject` sets the target version `Rejected`; `retire` sets `StageStatus=Retired`, dropping it from `Release`/`Shadow` selection without rejecting it.)
 - **Trigger** = the bucket is **versioned** and emits a native **"Object Created"** event → an **`events.Rule`** → a **starter Lambda**, which calls **`StartPipelineExecution` pinned to the exact S3 object version** that fired it (`sourceRevisions = S3_OBJECT_VERSION_ID`). The rule does **not** target the pipeline directly — a direct target can't pin a version.
 - **S3 Source** = the Model Promotion CodePipeline's **first action** (type S3), configured with **`trigger=NONE`**. It does *not* watch the bucket; it only *fetches* the pinned object version into the Source artifact once the starter has begun the execution.
 
@@ -734,10 +739,12 @@ Never hand-edit the stage/prod registry.
 
 | Step | Action |
 |------|--------|
-| 1 | In the dev registry, set `ModelApprovalStatus=Rejected` on the bad version; this emits a native event the orchestrator's de-promote path consumes and applies the same in the target registry |
-| 2 | Previous Approved version (retained in gold + registry) is selected automatically next run |
-| 3 | Confirm the target registry reflects the change (orchestrator de-promote, not a hand edit) |
+| 1 | In the dev registry, set `ModelApprovalStatus=Rejected` on the bad version; this emits a native event → the orchestrator writes a de-projection manifest to `depromote-latest.json`, which triggers the **fast-path Lambda directly** (no pipeline, **no prod approval wait**) and sets the same version `Rejected` in the target registry — **immediately** |
+| 2 | If the rejected version was the active `Release`, the fast-path un-retires the most-recent `Retired` predecessor back to `Release`, so a valid Release remains and is selected automatically next run |
+| 3 | Confirm the target registry reflects the change (fast-path de-projection, not a hand edit) |
 | 4 | Record incident + CloudTrail reference |
+
+> **De-shadow (retire) is the same fast path.** To stop a `Shadow` (or step a `Release` aside) *without* condemning it, set `StageStatus=Retired` in dev → the orchestrator writes a `retire` de-projection → the fast-path sets `StageStatus=Retired` in the target (kept `Approved`, rollback-able). Break-glass **reject** and **retire** both bypass the pipeline and its approval gate — only forward **promotions** run the CodePipeline.
 
 ---
 
