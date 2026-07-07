@@ -412,6 +412,75 @@ flowchart TD
 
 ---
 
+## Diagram 4b — Promotion Gate Flow (UI click → registered)
+
+The runtime gates from the ML Lead's `UpdateModelPackage` click through to a registered version. Each
+gate shows the value that lets it **continue** vs the **exit**. Reject/retire split off at Gate 3 to
+the approval-free fast path; **Staging skips the PROD-only gates (5 and 8)**.
+
+```mermaid
+flowchart TD
+    classDef gate  fill:#1565c0,stroke:#0d47a1,color:#fff
+    classDef exit  fill:#b71c1c,stroke:#7f0000,color:#fff
+    classDef retry fill:#e65100,stroke:#bf360c,color:#fff
+    classDef done  fill:#2e7d32,stroke:#1b5e20,color:#fff
+    classDef fast  fill:#4a148c,stroke:#311b92,color:#fff
+
+    UI["UI — ML Lead UpdateModelPackage"]
+    G0{"Gate 0 — Governance IAM\nrole may set Stage=Production / StageStatus=Release?"}
+    G1{"Gate 1 — EventBridge rule\nStage advanced to Staging/Production,\nOR ModelApprovalStatus=Rejected?  · group prefix app-"}
+    G2{"Gate 2 — SQS + app-group guard\ngroup starts with app-?  · batched ~60s"}
+    G3{"Gate 3 — Classify"}
+    FAST["Gate 6 reject/retire\nManifest to depromote-latest.json\nFast-path Lambda — applies directly, no pipeline"]
+    G4{"Gate 4 — Eligibility\nApproved AND StageStatus=Release/Shadow\nAND family+model AND version ts?"}
+    G5{"Gate 5 — Stage-gold gate — PROD only\nartifact already in STAGE gold?"}
+    MAN["Gate 6 promote\nManifest to latest.json\nstarter Lambda to StartPipelineExecution"]
+    G7{"Gate 7 — CopyModels\naws s3 sync gold to gold ok?"}
+    G8{"Gate 8 — Manual Approval — PROD only\nhuman approves within 7 days?"}
+    G9{"Gate 9 — RegisterModel\ncreate/update Approved + role ok?"}
+    DONE["DONE — registered in target registry\nrole=Release retires the prior Release"]
+
+    X0["exit — AccessDenied"]
+    X1["exit — no event\napprove-only / Development / foreign app"]
+    X2["skip — foreign group"]
+    XDROP["DROP — no retry\nNotEligible: missing Approved / role / metadata"]
+    XRETRY["RETRY then DLQ after 5\n404 not staged first / 403 perms"]
+    X7["pipeline fails — sync error"]
+    X8["stops — rejected or 7-day expiry"]
+    X9["pipeline fails — e.g. empty family or model"]
+
+    UI --> G0
+    G0 -->|"authorized"| G1
+    G0 -->|"denied"| X0
+    G1 -->|"matches"| G2
+    G1 -->|"no match"| X1
+    G2 -->|"app- ok"| G3
+    G2 -->|"foreign"| X2
+    G3 -->|"reject / retire"| FAST
+    G3 -->|"promote"| G4
+    G4 -->|"all pass"| G5
+    G4 -->|"any fail"| XDROP
+    G5 -->|"present · Staging skips"| MAN
+    G5 -->|"404 / 403"| XRETRY
+    MAN --> G7
+    G7 -->|"ok"| G8
+    G7 -->|"fail"| X7
+    G8 -->|"approved · Staging skips"| G9
+    G8 -->|"reject / expire"| X8
+    G9 -->|"ok"| DONE
+    G9 -->|"error"| X9
+
+    class G0,G1,G2,G3,G4,G5,G7,G8,G9 gate
+    class X0,X1,X2,XDROP,X7,X8,X9 exit
+    class XRETRY retry
+    class FAST fast
+    class DONE done
+```
+
+_Blue = gate · red = exit (no retry) · orange = retry then DLQ · purple = fast-path (reject/retire) · green = done._
+
+---
+
 ## Diagram 5 — Governance Decision Tree
 
 ```mermaid
