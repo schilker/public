@@ -17,7 +17,8 @@ This document proposes how an approved model (and its artifact files) should cro
 
 **The happy path, end to end:**
 
-1. **Train + register** — the training pipeline registers a new version in the dev registry (`ModelApprovalStatus=PendingManualApproval`, `ModelLifeCycle.Stage=Development / ModelLifeCycle.StageStatus=PendingQualityGate`).
+
+1. **Train + register** — the training pipeline registers a new version in the dev registry (`ModelApprovalStatus=PendingManualApproval`, `ModelLifeCycle.Stage=Development / ModelLifeCycle.StageStatus=PendingApproval`).
 2. **Approve for Release** — the DS/MLE verifies the model performance either manually or via automated quality checks and sets `ModelApprovalStatus=Approved` and `ModelLifeCycle.StageStatus=Release` (or `Shadow`) in dev Studio. This makes it *eligible* but moves nothing.
 3. **Advance to stage** — the MLE or ML Lead sets `ModelLifeCycle.Stage=Staging`. Automation copies the model into the stage account and registers it there; stage inference starts serving it.
 4. **Advance to prod** — the ML Lead sets `ModelLifeCycle.Stage=Production`. Same flow, plus one human approval gate before it goes live.
@@ -38,7 +39,7 @@ This document proposes how an approved model (and its artifact files) should cro
 | **`ModelApprovalStatus`** | Native field on a version: `Approved` / `Rejected` / `PendingManualApproval`. Global safety gate — `Rejected` excludes the version everywhere. |
 | **`ModelLifeCycle`** | Native field with `Stage`, `StageStatus`, and `StageDescription`. Advancing `Stage` is the promotion trigger; `StageStatus` encodes deployment intent (Release, Shadow, etc.). Both are IAM-conditionable and emit native EventBridge events. |
 | **`Stage`** | Where the model is heading: `Development` → `Staging` → `Production`. The orchestrator routes on this value from the event payload. |
-| **`StageStatus`** | What kind of deployment + current state. Replaces the old `candidate_type` / `promote` / `quality_gate_passed` tags. Values: `PendingQualityGate`, `QualityGatePassed`, `QualityGateFailed`, `Release`, `Shadow`, `Experimental`, `Active`, `Superseded`, `Rejected`. |
+| **`StageStatus`** | The deployment **role** once a version is advanced (replaces the old `candidate_type` / `promote` / `quality_gate_passed` tags). Values: `PendingApproval` (in Development, a placeholder), `Release` (primary, served), `Shadow` (offline comparison, never served), `Retired` (superseded `Release` or de-shadowed, kept `Approved`). The quality gate is IAM (who may set `Release`), not a status. |
 | **bless** | Setting `ModelApprovalStatus=Approved` + `StageStatus=Release` (or `Shadow`) — makes a version eligible but moves nothing. |
 | **release vs shadow** | A family serves 1 **release** model (`StageStatus=Release`) plus N **shadow** models (`StageStatus=Shadow`) that run for comparison only, never primary traffic. |
 | **eligibility** | The orchestrator's promote condition: `Approved` + `StageStatus ∈ {Release, Shadow}` + `Stage ∈ {Staging, Production}`. No tag reads needed — the event payload carries everything. |
@@ -61,7 +62,7 @@ This document proposes how an approved model (and its artifact files) should cro
 
 **De-promotion works the same way.** Setting `ModelApprovalStatus=Rejected` on a dev version emits a native event the orchestrator's de-promote path consumes, propagating the rejection to stage/prod registries automatically. See "Rejection & De-promotion" for details.
 
-**Selection:** The inference pipeline selects the current `Approved` model with `StageStatus ∈ {Active, Release}` at execution time from the local registry. A model-version change requires no CDK redeploy and no pipeline upsert — the next scheduled run picks it up.
+**Selection:** The inference pipeline selects the current `Approved` model with `StageStatus=Release` at execution time from the local registry. A model-version change requires no CDK redeploy and no pipeline upsert — the next scheduled run picks it up.
 
 ---
 
@@ -69,7 +70,7 @@ This document proposes how an approved model (and its artifact files) should cro
 
 | Concern | Current | Proposed |
 |---------|---------|--------|
-| Inference selection | The inference container queries the registry at runtime but matches a `MODEL_VERSION` pinned at synth time from a static catalog. | Select latest `Approved` + `StageStatus ∈ {Active, Release}` from the local registry instead of a pinned version. No tags needed — filter on native `ModelLifeCycle` fields. |
+| Inference selection | The inference container queries the registry at runtime but matches a `MODEL_VERSION` pinned at synth time from a static catalog. | Select latest `Approved` + `StageStatus=Release` from the local registry instead of a pinned version. No tags needed — filter on native `ModelLifeCycle` fields. |
 | Version source of truth | A static catalog file lists approved/pending versions per model. | `ModelApprovalStatus` + `ModelLifeCycle` (native fields); the catalog holds static topology only. No governance tags. |
 | Per-env registry authority | A registry-sync construct runs on every `cdk deploy` and rejects any registry version not listed in the catalog. | The RegisterModel step is the writer; remove the catalog enforcement (see "Reconciling the registry-sync Lambda"). |
 | Artifact copy | An existing CodeBuild project (us-east-1 only) does selective per-version artifact copies. | Reused by the new Model Promotion Pipeline. |
@@ -122,53 +123,41 @@ All governance state lives on the **model package version** in the SageMaker Mod
 
 ### Accepted `StageStatus` values
 
-| Value | Meaning                                                                          | Valid with `Stage=` | Who can set                                                              |
-|-------|----------------------------------------------------------------------------------|-------------------|--------------------------------------------------------------------------|
-| `PendingQualityGate` | Just registered; automated checks pending                                        | `Development` | Training pipeline (auto)                                                 |
-| `QualityGatePassed` | Automated checks passed; ready for human review                                  | `Development` | Training pipeline (auto) / Quality gate automation / Manual verification |
-| `QualityGateFailed` | Automated checks failed; not promotable                                          | `Development` | Training pipeline (auto) / Quality gate automation / Manual verification |
-| `Release` | Blessed for production serving (primary model)                                   | `Development`, `Staging`, `Production` | DS (Dev), MLE (Stage), ML Lead (Prod)                                    |
-| `Shadow` | Blessed for shadow evaluation (never serves primary traffic)                     | `Development`, `Staging`, `Production` | DS (Dev), MLE (Stage), ML Lead (Prod)                                    |
-| `Experimental` | Test/POC; never promoted                                                         | `Development` | DS, MLE                                                                  |
-| `Active` | Live and serving in the target environment                                       | `Staging`, `Production` | RegisterModel (auto)                                                     |
-| `Superseded` | Replaced by a newer version; retained for rollback                               | `Staging`, `Production` | RegisterModel (auto)                                                     |
-| `Rejected` | Rejected from a specific environment (per-stage); see "Rejection & De-promotion" | Any | DS, MLE, ML Lead                                                         |
+`StageStatus` carries the deployment **role** once a version is advanced. The quality gate is **not** a
+status — it is enforced by IAM (who may set `StageStatus=Release`).
 
-> **Note:** `StageStatus` values are free-form strings (SageMaker does not enforce an enum). Validation check is put in place in the orchestrator Lambda that rejects unknown values before acting.
+| Value | Meaning | Valid with `Stage=` | Who sets |
+|-------|---------|---------------------|----------|
+| `PendingApproval` | Just registered; not yet advanced (a placeholder status, not a role) | `Development` | registry-sync registration (auto) |
+| `Release` | The **primary** serving model (the role) | `Staging`, `Production` | ML Lead advance (IAM-gated — this *is* the quality gate) |
+| `Shadow` | Scored offline for comparison; never serves primary traffic | `Staging`, `Production` | ML Lead advance |
+| `Retired` | Retired `Release` or de-shadowed; kept `Approved` (rollback-able), dropped from `Release`/`Shadow` selection | `Staging`, `Production` | RegisterModel (retires the prior `Release`) / the reject-retire fast path |
+
+> **Note:** `StageStatus` is a free-form string (SageMaker enforces no enum). The orchestrator validates it — eligibility requires `StageStatus ∈ {Release, Shadow}`; `Retired` routes to the de-projection fast path; anything else is dropped.
 
 ### State machine (valid transitions)
 
 ```
-Training registers
-  → Development / PendingQualityGate
+Registered (registry-sync, dev):
+  → Development / PendingApproval        (ModelApprovalStatus=PendingManualApproval)
 
-Quality gate (automated)
-  → Development / QualityGatePassed     (pass)
-  → Development / QualityGateFailed     (fail)
+Human bless (dev):
+  → Approved  (eligible to advance)  |  Rejected
 
-Human bless (Development only):
-  → Development / Release               (approved for primary serving)
-  → Development / Shadow                (approved for shadow evaluation)
-  → Development / Experimental          (test/poc, never promoted)
+Advance to stage (requires Approved + StageStatus in {Release, Shadow}):
+  → Staging / Release                   (native event → orchestrator routes)
+  → Staging / Shadow
 
-Promote to stage (requires Approved + Release or Shadow):
-  → Staging / Release                   (event fires, orchestrator routes)
-  → Staging / Shadow                    (event fires, orchestrator routes)
+Advance to prod (requires Approved + role + stage-gold present):
+  → Production / Release
+  → Production / Shadow
 
-After stage pipeline completes (target registry):
-  → Staging / Active                    (set by RegisterModel)
+One Release per group, per Stage — a new Release retires the prior one:
+  → Staging|Production / Retired         (kept Approved, rollback-able; a Shadow is never retired)
 
-Promote to prod (requires Approved + Release or Shadow + stage-gold present):
-  → Production / Release                (event fires, orchestrator routes)
-  → Production / Shadow                 (event fires, orchestrator routes)
-
-After prod gate + RegisterModel (target registry):
-  → Production / Active                 (set by RegisterModel after gate)
-
-Rejection:
-  → ModelApprovalStatus=Rejected        (global — propagates to all envs)
-  → StageStatus=Rejected                (per-env — removes from specific env)
-  → Staging / Superseded or Production / Superseded  (replaced by newer)
+De-projection (fast path — no pipeline, no approval):
+  → ModelApprovalStatus=Rejected        (break-glass reject; propagates to targets, immediate)
+  → StageStatus=Retired                 (retire / de-shadow, keeps Approved)
 ```
 
 ### Lineage metadata (kept as `CustomerMetadataProperties`)
@@ -200,42 +189,47 @@ flowchart TD
         direction TB
         TRAIN["Training Pipeline\n(dev / altdev only)"]
         DEVGOLD[("Dev Gold Bucket (mlops-hub)\nbcnc-gold-mlops-hub-dev-{region}\n{family}/{model}/versions/{ts}/")]
-        DEVREG[["Dev Model Registry\nPendingManualApproval\nDevelopment / PendingQualityGate"]]
+        DEVREG[["Dev Model Registry\nPendingManualApproval\nStage=Development · StageStatus=PendingApproval"]]
         TRAIN -- "writes versioned artifact" --> DEVGOLD
         DEVGOLD -- "ModelStep registers" --> DEVREG
 
-        QG["Quality gate (automated)\nsets StageStatus=QualityGatePassed"]
+        QG["Quality checks (offline)\ngate = IAM on who may set StageStatus=Release"]
         DEVREG -. " " .-> QG
-        QG -- "UpdateModelPackage" --> DEVREG
 
-        APPROVE(["[UI] MLE / ML Lead — bless\nApproved + StageStatus=Release / Shadow"])
+        APPROVE(["[UI] ML Lead — bless\nApproved"])
         DEVREG -. "review" .-> APPROVE
-        APPROVE -- "UpdateModelPackage" --> DEVREG
+        QG -. "informs bless" .-> APPROVE
+        APPROVE -- "UpdateModelPackage (status)" --> DEVREG
 
-        PROMOTE(["[UI] ML Lead — Update model lifecycle\nStage=Staging, then Stage=Production\n(native Studio action)"])
-        EB["EventBridge Rule\nSageMaker Model Package State Change\nUpdatedModelPackageFields=[ModelLifeCycle]"]
-        ORCH["Dev Orchestrator Lambda\ntarget = detail.ModelLifeCycle.Stage,\nvalidates eligibility, writes manifest\nprod: HeadObject stage-gold gate"]
+        PROMOTE(["[UI] ML Lead — Update model lifecycle\nStage=Staging → Production +\nStageStatus=Release / Shadow\n(one native Studio action)"])
+        EB["EventBridge Rules (2)\nModel Package State Change · prefix={app}-\n(1) ModelLifeCycle → promote / retire\n(2) ModelApprovalStatus=Rejected → de-promote"]
+        EVQ["SQS event queue (+ DLQ)\nbatch window coalesces a burst"]
+        ORCH["Dev Orchestrator Lambda\nbatched: validate eligibility,\nwrite ONE manifest per env (items[])\nprod: HeadObject stage-gold gate"]
 
         APPROVE -. "after bless" .-> PROMOTE
-        PROMOTE -- "UpdateModelPackage ModelLifeCycle.Stage" --> DEVREG
+        PROMOTE -- "UpdateModelPackage Stage + StageStatus" --> DEVREG
         DEVREG -- "native event" --> EB
-        EB --> ORCH
+        EB -- "to queue" --> EVQ
+        EVQ -- "SQS batch" --> ORCH
     end
 
     subgraph STAGE["☁️  STAGE ACCOUNT"]
         direction TB
-        STAGEMAN[("Stage Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-stage-{region}\nfixed key · BucketOwnerEnforced")]
-        subgraph SP["Model Promotion Pipeline"]
+        STAGEMAN[("Stage Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-stage-{region}\nlatest.json=promote · depromote-latest.json=reject/retire\nversioned · BucketOwnerEnforced")]
+        STAGESTART["events.Rule (latest.json Object Created)\n→ starter Lambda\nStartPipelineExecution (pins object version)"]
+        subgraph SP["Model Promotion Pipeline (QUEUED)"]
             direction LR
-            SS1["S3 Source\n(watches manifest object)"]
+            SS1["S3 Source (trigger=NONE)\nfetches pinned object version"]
             SS2["CopyModels\ngold(dev)→gold(stage)"]
-            SS3["RegisterModel\nlocal · sets Approved · idempotent"]
+            SS3["RegisterModel\nsets Approved+role · idempotent\nrole=Release retires prior Release"]
             SS1 --> SS2 --> SS3
         end
         STAGEGOLD[("Stage Gold Bucket (mlops-hub)\nbcnc-gold-mlops-hub-stage-{region}")]
         STAGEREG[["Stage Registry\nprojection · IAM-locked"]]
-        STAGEINF["Stage Inference\nselects Approved + Active\nat execution time"]
-        STAGEMAN --> SS1
+        STAGEINF["Stage Inference\nselects Approved + StageStatus=Release\nat execution time"]
+        STAGEFAST["events.Rule (depromote-latest.json)\n→ Fast-path Lambda · reject/retire\napplies directly · no pipeline"]
+        STAGEMAN -- "latest.json · Object Created" --> STAGESTART -- "start (pinned)" --> SS1
+        STAGEMAN -- "depromote-latest.json" --> STAGEFAST -- "apply directly" --> STAGEREG
         SS2 --> STAGEGOLD
         SS3 --> STAGEREG
         STAGEREG -. "runtime query" .-> STAGEINF
@@ -244,19 +238,22 @@ flowchart TD
 
     subgraph PROD["☁️  PROD ACCOUNT"]
         direction TB
-        PRODMAN[("Prod Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-prod-{region}\nfixed key · BucketOwnerEnforced")]
-        subgraph PP["Model Promotion Pipeline"]
+        PRODMAN[("Prod Manifest Bucket (mlops-hub)\nbcnc-manifest-mlops-hub-prod-{region}\nlatest.json=promote · depromote-latest.json=reject/retire\nversioned · BucketOwnerEnforced")]
+        PRODSTART["events.Rule (latest.json Object Created)\n→ starter Lambda\nStartPipelineExecution (pins object version)"]
+        subgraph PP["Model Promotion Pipeline (QUEUED)"]
             direction LR
-            PP1["S3 Source\n(watches manifest object)"]
+            PP1["S3 Source (trigger=NONE)\nfetches pinned object version"]
             PP2["CopyModels\ngold(stage)→gold(prod)"]
             PP4(["[UI] Manual Approval\n7-day expiry"])
-            PP3["RegisterModel\nsets Approved AFTER gate"]
+            PP3["RegisterModel\nsets Approved+role AFTER gate\nrole=Release retires prior Release"]
             PP1 --> PP2 --> PP4 --> PP3
         end
         PRODGOLD[("Prod Gold Bucket (mlops-hub)\nbcnc-gold-mlops-hub-prod-{region}\nunserved until RegisterModel")]
         PRODREG[["Prod Registry\nprojection · IAM-locked"]]
-        PRODINF["Prod Inference\nselects Approved + Active\nat execution time"]
-        PRODMAN --> PP1
+        PRODINF["Prod Inference\nselects Approved + StageStatus=Release\nat execution time"]
+        PRODFAST["events.Rule (depromote-latest.json)\n→ Fast-path Lambda · reject/retire\napplies directly · no pipeline · no approval"]
+        PRODMAN -- "latest.json · Object Created" --> PRODSTART -- "start (pinned)" --> PP1
+        PRODMAN -- "depromote-latest.json" --> PRODFAST -- "apply directly" --> PRODREG
         PP2 --> PRODGOLD
         PP3 --> PRODREG
         PRODREG -. "runtime query" .-> PRODINF
@@ -268,26 +265,31 @@ flowchart TD
 
     class APPROVE,PROMOTE,PP4 human
     class TRAIN,QG,SS2,PP2,STAGEINF,PRODINF auto
-    class EB,ORCH,SS1,SS3,PP1,PP3,STAGEMAN,PRODMAN new
+    class EB,EVQ,ORCH,STAGESTART,PRODSTART,STAGEFAST,PRODFAST,SS1,SS3,PP1,PP3,STAGEMAN,PRODMAN new
     class DEVGOLD,STAGEGOLD,PRODGOLD store
     class DEVREG,STAGEREG,PRODREG reg
 ```
 
 The prod Manual Approval runs before RegisterModel writes `Approved`, so a scheduled run cannot serve an unapproved model. CopyModels may run before the gate; the artifact sits in prod gold unserved until the gated registration.
 
-**Human touchpoints (UI) — all in the dev account:** (1) ML Lead governance decision (Approve / Shadow / Reject) via "Update status" in the registry; (2) Promote → stage by setting `ModelLifeCycle.Stage=Staging`; (3) Promote → prod by setting `ModelLifeCycle.Stage=Production` — both via Studio's native "Update model lifecycle" action. The only UI action outside dev is (4) the CodePipeline approval gate in the prod account. The quality gate is automated. Each lifecycle transition emits the native event that drives the orchestrator. Stage/prod registries take no human edits (IAM-locked).
+**Human touchpoints (UI) — all in the dev account:** (1) ML Lead governance decision (Approve / Reject) via "Update status" in the registry; (2) Promote → stage by setting `ModelLifeCycle.Stage=Staging` with `StageStatus=Release` (or `Shadow`); (3) Promote → prod by setting `Stage=Production` (again with the role) — both via Studio's native "Update model lifecycle" action. The only UI action outside dev is (4) the CodePipeline approval gate in the prod account. The quality gate is **operational — IAM restricts who may set `StageStatus=Release`**. Each lifecycle transition emits the native event that drives the orchestrator. Stage/prod registries take no human edits (IAM-locked).
 
 > **Trigger wiring:** Promotion is driven by the model's native `ModelLifeCycle` stage, not a custom tag — precisely because SageMaker emits a native `SageMaker Model Package State Change` EventBridge event when `ModelLifeCycle` (or `ModelApprovalStatus`) changes, but **not** when a tag changes. Advancing the stage in Studio fires the event for free (`source=aws.sagemaker`, `detail-type="SageMaker Model Package State Change"`, `detail.UpdatedModelPackageFields=["ModelLifeCycle"]`, `detail.ModelLifeCycle.Stage` = the target env). No Promote Control, no `PutEvents`, and no CloudTrail fallback are needed: the trigger is first-class. The orchestrator routes on `Stage` + `StageStatus` carried in the event payload — no tag reads, no read-after-write race. Eligibility = `Approved` + `StageStatus ∈ {Release, Shadow}`.
 
 **Approval gate — CodePipeline with auto-generated manifest (chosen approach):**
 
-The prod approval gate is implemented via a **Model Promotion CodePipeline** triggered by a manifest S3 object (see Tier 2 for full details). The orchestrator writes a **promotion manifest** JSON to a per-env S3 bucket — auto-generated, never manually edited. A CodePipeline S3 source watches that fixed-key object and auto-starts when its content changes; the pipeline runs CopyModels → Manual Approval → RegisterModel. Shape:
+The prod approval gate is implemented via a **Model Promotion CodePipeline** triggered by a manifest S3 object (see Tier 2 for full details). The orchestrator writes a **promotion manifest** JSON per target env to a per-app key (`manifests/{app}/latest.json`) — auto-generated, never manually edited. `schema_version: "2"` carries an `items[]` list, so a **batch** of UI clicks becomes **one manifest → one pipeline execution**. The bucket is **versioned** and emits an `Object Created` event → an `events.Rule` → a **starter Lambda** that calls `StartPipelineExecution` pinned to that exact object version; the pipeline runs CopyModels → Manual Approval → RegisterModel. Shape:
   ```json
-  { "action": "promote", "family": "fraud", "model": "txn_scorer", "version": "20260416_2253",
-    "stage_status": "Release", "source_gold": "s3://bcnc-gold-mlops-hub-dev-us-east-1/...",
-    "target_gold": "s3://bcnc-gold-mlops-hub-stage-us-east-1/..." }
+  { "schema_version": "2", "action": "promote", "source_env": "dev",
+    "target_env": "stage", "target_stage": "Staging",
+    "items": [
+      { "family": "fraud", "model": "txn_scorer", "version": "20260416_2253", "role": "Release",
+        "source_gold": "s3://bcnc-gold-mlops-hub-dev-us-east-1/...",
+        "target_gold": "s3://bcnc-gold-mlops-hub-stage-us-east-1/...",
+        "promotion_id": "stage-fraud-txn_scorer-20260416_2253" }
+    ] }
   ```
-  Because the source is one fixed key, the manifest content must change per promotion (include the version) or the source won't re-trigger.
+  **Reject / retire** don't run the pipeline: the orchestrator writes them to a **separate key** (`manifests/{app}/depromote-latest.json`, `action:"deproject"`, per-item `kind: reject|retire`) which triggers a **fast-path Lambda directly — no CopyModels, no approval** — so a break-glass reject applies immediately.
 
 > **Note on SSM Automation:** SSM Automation Documents are a potential future candidate for approval gates and reacting to model status/lifecycle changes. However, they have not yet been approved for use in the shared services account. CodePipeline with a manifest file is the chosen path to make progress; SSM Automation can be revisited once approved.
 
@@ -302,28 +304,28 @@ flowchart TD
 
     subgraph DS["Dev → Stage  (lifecycle-triggered)"]
         direction LR
-        T2a(["[UI] Bless\nApproved + StageStatus=Release\n(no movement)"])
+        T2a(["[UI] Bless\nApproved\n(no movement)"])
         T2(["[UI] Update model lifecycle\nStage=Staging, StageStatus=Release"])
         A0["Native event\nModelLifeCycle changed"]
-        A1["EventBridge → orchestrator"]
-        A2["Orchestrator Lambda\ntarget=Staging · validate · write manifest"]
+        A1["EventBridge → SQS → orchestrator\n(batched)"]
+        A2["Orchestrator Lambda\nvalidate · write ONE stage manifest (items[])"]
         A3["Stage CodePipeline\nS3 source"]
         A4["CopyModels → RegisterModel"]
-        A6["Next inference run\nselects Approved + Active"]
+        A6["Next inference run\nselects Approved + StageStatus=Release"]
         T2a --> T2 --> A0 --> A1 --> A2 --> A3 --> A4 -.-> A6
     end
 
     subgraph SPx["Stage → Prod  (lifecycle-triggered + gate)"]
         direction LR
-        T3(["[UI] Update model lifecycle\nStage=Production"])
+        T3(["[UI] Update model lifecycle\nStage=Production + StageStatus=Release"])
         B0a["Native event\nModelLifeCycle changed"]
-        B0["EventBridge → orchestrator"]
-        B1["Orchestrator Lambda\nHeadObject stage-gold gate · write manifest"]
+        B0["EventBridge → SQS → orchestrator\n(batched)"]
+        B1["Orchestrator Lambda\nHeadObject stage-gold gate · write ONE prod manifest (items[])"]
         B2["Prod CodePipeline\nS3 source"]
         B3["CopyModels → prod gold\n(unserved)"]
         T4(["[UI] Approve\n7-day expiry"])
         B4["RegisterModel\nsets Approved"]
-        B5["Next inference run\nselects Approved + Active"]
+        B5["Next inference run\nselects Approved + StageStatus=Release"]
         T3 --> B0a --> B0 --> B1 --> B2 --> B3 --> T4 --> B4 -.-> B5
     end
 
@@ -360,7 +362,7 @@ flowchart TD
         end
         subgraph MODELPIPE["② Model Promotion CodePipeline  (manifest triggered)"]
             direction LR
-            M1["S3 Source\nwatches manifest (fixed key)"]
+            M1["S3 Source (trigger=NONE)\nstarter Lambda pins object version"]
             M2["CopyModels\n(CodeBuild action)"]
             M4(["Manual Approval\nprod only · before register"])
             M3["RegisterModel\nLambda · idempotent · sets Approved"]
@@ -395,26 +397,26 @@ flowchart TD
     classDef prod    fill:#4a148c,stroke:#311b92,color:#fff
 
     TRAIN["Training registers in dev"]
-    S1A["1A Just Registered\nPending\nDevelopment / PendingQualityGate\nblocked"]
-    S1B["1B Quality Gate Passed\nPending\nDevelopment / QualityGatePassed\nblocked"]
+    S1A["1A Just Registered\nPending · Stage=Development\nblocked (not advanced)"]
+    S1B["1B Reviewed\nPending · Stage=Development\n(offline checks passed)"]
     S1C["1C Rejected\nModelApprovalStatus=Rejected\npermanently blocked"]
-    S1D["1D Test / POC\nDevelopment / Experimental\npermanently blocked"]
-    S2A["2A Approved Release\nApproved\nDevelopment / Release\neligible — set Stage=Staging to move"]
-    S2B["2B Approved Shadow\nApproved\nDevelopment / Shadow\neligible — set Stage=Staging to move"]
-    STAGE["IN STAGE\nStaging / Active\ninference selects at runtime\nprod: set Stage=Production + gold check"]
+    S1D["1D Test / POC\nstays in Development\nnever advanced"]
+    S2A["2A Approve + advance Release\nApproved · Stage=Staging · StageStatus=Release\n(Release gated by IAM)"]
+    S2B["2B Approve + advance Shadow\nApproved · Stage=Staging · StageStatus=Shadow"]
+    STAGE["IN STAGE\nstage gold + registry Approved\ninference selects StageStatus=Release at runtime\nprod: set Stage=Production + gold check"]
     PRODQ["PROD QUEUED\nprod gold present · paused at gate\nnot served (register follows gate)"]
-    PROD["PROMOTED\nProduction / Active\ninference selects at runtime"]
+    PROD["PROMOTED\nall gold + registries updated\ninference selects at runtime"]
 
     TRAIN --> S1A
-    S1A -->|"quality gate passes"| S1B
+    S1A -->|"offline checks pass"| S1B
     S1A -->|"reject"| S1C
-    S1A -->|"experimental"| S1D
-    S1B -->|"Approved + StageStatus=Release"| S2A
-    S1B -->|"Approved + StageStatus=Shadow"| S2B
+    S1A -->|"never deploy"| S1D
+    S1B -->|"Approve + advance Release"| S2A
+    S1B -->|"Approve + advance Shadow"| S2B
     S1B -->|"reject"| S1C
-    S1B -->|"experimental"| S1D
-    S2A -->|"set Stage=Staging"| STAGE
-    S2B -->|"set Stage=Staging"| STAGE
+    S1B -->|"never deploy"| S1D
+    S2A -->|"native event → orchestrator"| STAGE
+    S2B -->|"native event → orchestrator"| STAGE
     STAGE -->|"set Stage=Production"| PRODQ
     PRODQ -->|"approve → register"| PROD
 
@@ -436,18 +438,18 @@ flowchart TD
     classDef auto  fill:#1565c0,stroke:#0d47a1,color:#fff
     classDef dead  fill:#757575,stroke:#616161,color:#fff
 
-    START["Training completes\nPending\nDevelopment / PendingQualityGate"]
-    QG["Quality gate (automated)"]
+    START["Training registers in dev\nPending · Stage=Development · PendingApproval"]
+    QG["Quality checks (offline)"]
     START --> QG
-    FAIL["StageStatus=QualityGateFailed\nnot eligible · never promoted"]
-    PASS["StageStatus=QualityGatePassed\nready for review"]
+    FAIL["checks fail\nnot advanced"]
+    PASS["checks pass\nready for review"]
     QG -- "fail" --> FAIL
     QG -- "pass" --> PASS
-    DEC(["[UI] MLE / ML Lead decision"])
+    DEC(["[UI] ML Lead decision"])
     PASS --> DEC
-    REL["RELEASE\nApproved · StageStatus=Release\n→ primary model"]
-    SHAD["SHADOW\nApproved · StageStatus=Shadow\n→ shadow slot"]
-    TEST["EXPERIMENTAL\nStageStatus=Experimental\nnever promoted"]
+    REL["RELEASE\nApproved · advance Stage + StageStatus=Release\n→ primary model"]
+    SHAD["SHADOW\nApproved · advance Stage + StageStatus=Shadow\n→ shadow slot"]
+    TEST["TEST / POC\nstays in Development"]
     REJ["REJECT\nModelApprovalStatus=Rejected"]
     DEC -- "production-ready" --> REL
     DEC -- "evaluate" --> SHAD
@@ -524,7 +526,7 @@ flowchart TD
 
     RESULTS[("results/")]
     SHADOUT[("shadow-outputs/")]
-    LOCALREG[["Local Registry\nApproved versions (Active + Shadow)\nMAX_SHADOW_NODES = 3"]]
+    LOCALREG[["Local Registry\nApproved versions (Release + Shadow)\nMAX_SHADOW_NODES = 3"]]
     LOCALGOLD[("Local Gold Bucket\nmodel.tar.gz")]
 
     SCHED --> PP
@@ -533,7 +535,7 @@ flowchart TD
     IS2 --> SHADOUT
     IS3 --> SHADOUT
 
-    IP -. "resolve at runtime\nlatest Approved + Active" .-> LOCALREG
+    IP -. "resolve at runtime\nlatest Approved + StageStatus=Release" .-> LOCALREG
     QL1 -. "Approved + Shadow · slot 1" .-> LOCALREG
     QL2 -. "Approved + Shadow · slot 2" .-> LOCALREG
     QL3 -. "Approved + Shadow · slot 3" .-> LOCALREG
@@ -564,7 +566,7 @@ flowchart TD
 | Behaviour | Detail |
 |-----------|--------|
 | Shared vs dedicated FE | Shared-vocab models (legacy or versioned-without-vocab) share one `FE_{family}`; own-vocab models get a dedicated `FE_{model}`. |
-| Runtime version resolution | Each inference container picks its model by querying the local registry (`ListModelPackages` by status, then filter `StageStatus` via `DescribeModelPackage`) — today against the synth-pinned `MODEL_VERSION`; target = latest `Approved` + `StageStatus ∈ {Active, Release}` / `Approved` + `StageStatus=Shadow`. |
+| Runtime version resolution | Each inference container picks its model by querying the local registry (`ListModelPackages` by status, then filter `StageStatus` via `DescribeModelPackage`) — today against the synth-pinned `MODEL_VERSION`; target = latest `Approved` + `StageStatus=Release` / `Approved` + `StageStatus=Shadow`. |
 | Change a model **version** | No CDK redeploy — the container resolves the new version at runtime. |
 | Change the **number** of shadows | Up to `MAX_SHADOW_NODES = 3`: no redeploy — each slot is gated by `LambdaStep` + `ConditionStep`; unused slots are skipped at runtime. Raising the cap beyond 3 requires a CDK deploy to add more slot pairs to the pipeline definition. |
 | Outputs | Release → `results/`; every shadow → `shadow-outputs/` for offline comparison; shadows never serve primary traffic. |
@@ -638,9 +640,9 @@ The default state of every model; it stays here until lifecycle fields explicitl
 |-------|-------|
 | `ModelApprovalStatus` | `PendingManualApproval` |
 | `ModelLifeCycle.Stage` | `Development` |
-| `ModelLifeCycle.StageStatus` | `PendingQualityGate` |
+| `ModelLifeCycle.StageStatus` | `PendingApproval` |
 
-Not eligible: still `Stage=Development` with `StageStatus=PendingQualityGate`, not Approved.
+Not eligible: still `Stage=Development` with `StageStatus=PendingApproval`, not Approved.
 
 **1B — Quality gate passes (automated)**
 
@@ -648,7 +650,7 @@ Not eligible: still `Stage=Development` with `StageStatus=PendingQualityGate`, n
 |-------|-------|
 | `ModelApprovalStatus` | `PendingManualApproval` |
 | `ModelLifeCycle.Stage` | `Development` |
-| `ModelLifeCycle.StageStatus` | `QualityGatePassed` |
+| `ModelLifeCycle.StageStatus` | `PendingApproval` |
 
 Not eligible (not Approved, Stage still Development). Human review now available.
 
@@ -662,15 +664,15 @@ Not eligible (not Approved, Stage still Development). Human review now available
 
 Rejected — permanently excluded from all orchestrator queries. `ModelApprovalStatus=Rejected` is a global kill switch.
 
-**1D — Experimental (never intended for deployment)**
+**1D — Test / POC (never intended for deployment)**
 
 | Field | Value |
 |-------|-------|
 | `ModelApprovalStatus` | `PendingManualApproval` |
 | `ModelLifeCycle.Stage` | `Development` |
-| `ModelLifeCycle.StageStatus` | `Experimental` |
+| `ModelLifeCycle.StageStatus` | `PendingApproval` |
 
-Not eligible (`Experimental` is not a recognized promotion status); the orchestrator filters it out even if the stage were advanced.
+Not eligible — a test/POC version simply **stays in `Development`** and is never advanced. Even if the stage were advanced, `StageStatus` would not be `Release`/`Shadow`, so the orchestrator drops it.
 
 ### Scenario 2 — Approve, then advance to Stage
 
@@ -684,7 +686,7 @@ Approval blesses the version; setting `ModelLifeCycle.Stage=Staging` triggers th
 | `ModelLifeCycle.Stage` | `Development` |
 | `ModelLifeCycle.StageStatus` | `Release` ← key change |
 
-Approval blesses the version (no movement). The human advances `Stage=Staging` + `StageStatus=Release` in Studio → native event → EventBridge → orchestrator validates (`Approved` + `StageStatus=Release`) → writes the stage manifest → stage pipeline runs (CopyModels → RegisterModel sets `Approved` + `StageStatus=Active`, idempotent).
+Approval blesses the version (no movement). The human advances `Stage=Staging` + `StageStatus=Release` in Studio → native event → EventBridge → orchestrator validates (`Approved` + `StageStatus=Release`) → writes the stage manifest → stage pipeline runs (CopyModels → RegisterModel sets `Approved` + `StageStatus=Release`, idempotent).
 
 **2B — Approve as shadow**
 
@@ -694,14 +696,14 @@ Approval blesses the version (no movement). The human advances `Stage=Staging` +
 | `ModelLifeCycle.Stage` | `Development` |
 | `ModelLifeCycle.StageStatus` | `Shadow` |
 
-Set `Stage=Staging` + `StageStatus=Shadow`; orchestrator match: `Approved` + `StageStatus=Shadow`. Stage manifest carries `stage_status=Shadow` → stage wires it as a shadow slot (serves only `shadow-outputs/`, never primary traffic).
+Set `Stage=Staging` + `StageStatus=Shadow`; orchestrator match: `Approved` + `StageStatus=Shadow`. The stage manifest item carries `role=Shadow` → stage registers it as a `Shadow` (scored offline into `shadow-outputs/`, never primary traffic; it coexists with the `Release`).
 
 **State after the stage pipeline completes:**
 
 ```
 Dev Registry:    Approved, Stage=Staging, StageStatus=Release
 Dev Gold:        artifact present  ✓
-Stage Registry:  Approved, StageStatus=Active (projection)
+Stage Registry:  Approved, StageStatus=Release (projection)
 Stage Gold:      artifact present  ✓
 Prod Registry:   (empty for this version)
 Prod Gold:       no artifact
@@ -710,7 +712,8 @@ Prod Gold:       no artifact
 Prod is blocked until a human advances `Stage=Production`, which triggers the orchestrator to check:
 
 ```
-stage gold HeadObject → found ✓   (403/404 → promote to stage first, retryable)
+stage gold HeadObject → found ✓   (404 → promote to stage first, retryable;
+                                    403/other → hard perms error, fails loudly)
 ModelApprovalStatus=Approved  ✓
 StageStatus=Release           ✓
 → write prod manifest
@@ -718,14 +721,14 @@ StageStatus=Release           ✓
 
 ### Scenario 3 — Advance to Production, version reaches Prod
 
-After the human sets `Stage=Production` and the prod pipeline clears the approval gate (RegisterModel writes `Approved` + `StageStatus=Active` *after* the gate):
+After the human sets `Stage=Production` and the prod pipeline clears the approval gate (RegisterModel writes `Approved` + `StageStatus=Release` *after* the gate):
 
 ```
 Dev Registry:    Approved, Stage=Production, StageStatus=Release
 Dev Gold:        artifact present  ✓
-Stage Registry:  Approved, StageStatus=Active (projection)
+Stage Registry:  Approved, StageStatus=Release (projection)
 Stage Gold:      artifact present  ✓
-Prod Registry:   Approved, StageStatus=Active (projection)
+Prod Registry:   Approved, StageStatus=Release (projection)
 Prod Gold:       artifact present  ✓
 ```
 
@@ -747,71 +750,69 @@ Approved  AND  StageStatus ∈ {Release, Shadow}  AND  Stage=Production  AND  st
     → native event → orchestrator → prod pipeline · approval gate · register after gate
 ```
 
-### Scenario 4 — Rejection & De-promotion
+### Scenario 4 — Rejection, Retire & De-promotion (break-glass, fast path)
 
-Never hand-edit the stage/prod registry. All rejection actions happen on the **dev registry only**; the orchestrator propagates changes to target accounts automatically.
+Never hand-edit the stage/prod registry. All de-projection actions happen on the **dev registry only**; the orchestrator propagates them to the target accounts via the **approval-free fast path** — a break-glass reject must not wait behind the prod pipeline's 7-day gate.
 
-**`ModelApprovalStatus=Rejected` — global kill switch (model is bad everywhere)**
-
-| Step | Action |
-|------|--------|
-| 1 | In the dev registry, set `ModelApprovalStatus=Rejected` on the bad version. This emits a native `ModelApprovalStatus` change event. |
-| 2 | The orchestrator's de-promote path receives the event, identifies which target accounts have a copy (from the `Stage` field), and writes a de-promote manifest. |
-| 3 | The target pipeline's RegisterModel step sets the target version to `Rejected` (or `Superseded`). |
-| 4 | Previous Approved + Active version (retained in gold + registry) is selected automatically at the next inference run. |
-| 5 | Record incident + CloudTrail reference. |
-
-**`StageStatus=Rejected` — per-environment removal (operational rollback)**
-
-Use when the model isn't fundamentally bad, but needs to be removed from one specific environment (e.g., "prod latency is too high, revert" while keeping it in stage for debugging).
+**`ModelApprovalStatus=Rejected` — break-glass kill (model is bad everywhere)**
 
 | Step | Action |
 |------|--------|
-| 1 | In the dev registry, set `StageStatus=Rejected` while keeping `Stage=Production` (or `Staging`). Native event fires. |
-| 2 | Orchestrator sees `StageStatus=Rejected` + `Stage=Production` → writes a de-promote manifest for prod only. |
-| 3 | RegisterModel in prod sets the target version to `Rejected`. Stage version is unaffected. |
+| 1 | In the dev registry, set `ModelApprovalStatus=Rejected`. Rule 2 fires → the orchestrator writes a de-projection manifest (`action:"deproject"`, `kind:"reject"`) to `depromote-latest.json` for **stage AND prod**. |
+| 2 | Each target's **fast-path Lambda** (S3-triggered, **no pipeline, no approval**) sets that version `Rejected` **immediately**. If the version wasn't projected there, it's a safe no-op. |
+| 3 | If the rejected version was the active `Release`, the fast-path un-retires the most-recent `Retired` predecessor back to `Release`, so a valid Release remains and is selected next run. |
+| 4 | Record incident + CloudTrail reference. |
 
-**In practice, most rollbacks don't need either.** Simply promote the previous good version forward — RegisterModel auto-marks the old one as `Superseded`.
+**`StageStatus=Retired` — de-shadow / step a Release aside (without condemning it)**
 
-**Orchestrator logic (handles both promote and de-promote):**
+Use to stop a `Shadow` (or retire a `Release`) *without* marking it bad — e.g. it served its purpose, or a newer Release supersedes it.
+
+| Step | Action |
+|------|--------|
+| 1 | In the dev registry, set `StageStatus=Retired` (keeping `Stage=Staging`/`Production`). Rule 1 fires. |
+| 2 | The orchestrator writes a `kind:"retire"` de-projection → the target **fast-path Lambda** sets `StageStatus=Retired` there (kept `Approved`, artifact retained, rollback-able). |
+
+**In practice, most rollbacks need neither.** Simply promote the previous good version forward — RegisterModel auto-retires the old `Release` (one Release per group).
+
+**Orchestrator classification (promote vs de-project):**
 
 ```python
-def handle_event(event_detail: dict) -> dict:
-    """Route lifecycle/approval events to promote or de-promote actions."""
-    approval = event_detail.get("ModelApprovalStatus")
-    lifecycle = event_detail.get("ModelLifeCycle", {})
-    stage = lifecycle.get("Stage")
-    stage_status = lifecycle.get("StageStatus")
+# Per SQS record (the record body is the EventBridge event):
+fields = detail.get("UpdatedModelPackageFields") or []
 
-    # Global rejection — propagate to all target accounts
-    if approval == "Rejected":
-        return {"action": "reject", "targets": ["stage", "prod"]}
+# Break-glass reject → fast-path de-projection to stage + prod
+if "ModelApprovalStatus" in fields and detail.get("ModelApprovalStatus") == "Rejected":
+    di = _deproject_item(arn)                      # raises if unresolvable -> retry (not silent)
+    for env in ("stage", "prod"):
+        deproject_items.setdefault(env, []).append(_deproject_env_item(di, env, "reject"))
+    continue
 
-    # Per-stage rejection — propagate to specific target
-    if stage_status == "Rejected" and stage in ("Staging", "Production"):
-        target = "stage" if stage == "Staging" else "prod"
-        return {"action": "reject", "targets": [target]}
+lifecycle = detail.get("ModelLifeCycle") or {}
+target_env = STAGE_TO_ENV.get(lifecycle.get("Stage", ""))    # Staging->stage, Production->prod
+role = lifecycle.get("StageStatus", "")
 
-    # Promotion — forward to target
-    if (
-        approval == "Approved"
-        and stage in ("Staging", "Production")
-        and stage_status in ("Release", "Shadow")
-    ):
-        target = "stage" if stage == "Staging" else "prod"
-        return {"action": "promote", "targets": [target], "stage_status": stage_status}
+# Retire / de-shadow → fast-path de-projection to that env
+if role in RETIRE_STATUSES:                        # {"Retired"}
+    di = _deproject_item(arn)
+    deproject_items.setdefault(target_env, []).append(_deproject_env_item(di, target_env, "retire"))
+    continue
 
-    # No action (e.g., Development/QualityGatePassed — internal state only)
-    return {"action": "none"}
+# Promotion → validate + write ONE items[] manifest per env
+info = _describe_and_validate(arn, role)           # Approved + StageStatus in {Release, Shadow}
+if target_env == "prod":
+    _gate_stage_gold(info["gold_key"])             # HeadObject stage gold (404 -> retry)
+promote_items.setdefault(target_env, []).append(_manifest_item(info, target_env))
+# ...promote -> latest.json (pipeline); deproject -> depromote-latest.json (fast-path Lambda)
 ```
 
 **When to use which:**
 
-| | `ModelApprovalStatus=Rejected` | `StageStatus=Rejected` |
+| | `ModelApprovalStatus=Rejected` | `StageStatus=Retired` |
 |---|---|---|
-| **Scope** | Global — version is bad everywhere | Per-environment — remove from THIS env only |
-| **Effect** | Propagates to all target accounts | Propagates to one specific account |
-| **Use case** | Bug, data quality issue, compliance problem | Operational rollback, performance regression in one env |
+| **Meaning** | The model is **bad** — condemn it | Done / superseded — **step it aside**, keep it Approved |
+| **Scope** | Propagates to stage + prod | Propagates to the env it's set at |
+| **Path** | Fast-path Lambda (immediate, no approval) | Fast-path Lambda (immediate, no approval) |
+| **Rollback** | Un-retires a successor; or re-advance later | Re-graduate (`StageStatus=Release`) any time |
 | **Reversible?** | Technically yes, but semantically "this version is bad" | Yes — re-approve and re-promote later |
 
 ---
@@ -822,25 +823,24 @@ def handle_event(event_detail: dict) -> dict:
 |---------|-------|----------|
 | CopyModels fails | Artifact not fully in target gold | Re-run; copy is selective + re-runnable |
 | RegisterModel fails after copy | Artifact present, no Approved entry (safe) | Re-run; idempotent |
-| Duplicate promotion events (e.g. stage re-applied) | Orchestrator may run twice | Deterministic parameters + idempotent RegisterModel → no-op on second run |
-| Identical manifest overwrite (CodePipeline path) | S3 source may not re-trigger | Include version timestamp in manifest content per promotion |
+| Duplicate promotion events (e.g. stage re-applied) | Orchestrator may run twice | Deterministic manifest + idempotent RegisterModel → no-op on the second run |
+| Bulk / concurrent promotions to one env | Could fire N pipeline executions (or clobber a key) | The orchestrator **batches** SQS events → **one manifest per env → one execution** for the whole burst. Across separate batches, the bucket is **versioned**, the starter Lambda pins each execution's object version (`sourceRevisions`), and the pipeline runs **QUEUED** → no promotion is clobbered |
+| Break-glass reject / retire must be immediate | Can't wait on the prod approval | Reject/retire ride the **fast-path Lambda** (separate `depromote-latest.json` key) — no pipeline, no approval; applied at once |
+| Gate failure (skip-stage 404, 403 perms, unresolvable reject) | Record retried, then dead-lettered | Preserved in the **DLQ** (14-day retention) for inspection — not silently lost |
 | Approval not actioned within 7-day timeout | Prod CodePipeline execution fails; artifact in prod gold but unregistered | Re-apply `ModelLifeCycle.Stage=Production` (re-emits the native event) to trigger a fresh CodePipeline run; RegisterModel is idempotent |
-| Rapid successive `UpdateModelPackage` calls | Multiple orchestrator events; potentially multiple CodePipeline runs for the same version | Batch edits into a single API call where possible; orchestrator idempotency handles identical re-fires; configure CodePipeline `executionMode` to queue rather than run in parallel (see "Rapid Lifecycle Edits" below) |
 
 ---
 
-## Rapid Lifecycle Edits — Avoiding Duplicate Pipeline Triggers
+## Rapid Lifecycle Edits — Bursts Are Coalesced
 
-Each `UpdateModelPackage` call emits a native `SageMaker Model Package State Change` EventBridge event. If an operator makes several quick successive edits to `ModelLifeCycle` or `ModelApprovalStatus` — for example, correcting a `StageStatus` value immediately after setting `Stage`, or updating multiple model versions in quick succession — the orchestrator may receive multiple events and trigger **multiple concurrent CodePipeline executions** for the same or related model versions.
+Each `UpdateModelPackage` emits a native `SageMaker Model Package State Change` event. A burst — correcting a `StageStatus` right after setting `Stage`, or advancing many versions at once — would naively fire many events and many pipeline runs. The design handles this **built-in**:
 
-**Mitigations, in order of preference:**
+1. **SQS batch window (built-in, not future).** Both EventBridge rules deliver to an **SQS queue**; the orchestrator consumes it in **batches** (a ~60s window). A burst becomes **one batched invocation → one manifest per env (`items[]`) → one CodePipeline execution**, not N. (This is the SQS queue in Diagram 1.)
+2. **Set `Stage` + `StageStatus` in one call.** The normal promotion path sets both together — one combined event, not two.
+3. **Version-pinned + QUEUED across batches.** For promotions in *separate* batches, the manifest bucket is **versioned** and the starter Lambda pins each execution to the exact object version (`sourceRevisions`); the pipeline runs **QUEUED** → no run clobbers another.
+4. **Idempotent RegisterModel.** Matches by source timestamp → a duplicate or re-fired event is a no-op.
 
-1. **Batch edits into a single `UpdateModelPackage` call.** When changing both `Stage` and `StageStatus` together (the normal promotion path), set them in one API call — SageMaker emits one event for the combined change. Sequencing two separate `UpdateModelPackage` calls produces two events.
-2. **Orchestrator idempotency.** The orchestrator produces deterministic manifest content keyed on `{family}/{model}/{version}/{stage_status}`. If the orchestrator is triggered twice with identical event details, the second manifest write is identical to the first; CodePipeline's S3 source does not re-trigger on content-identical overwrites — effectively a no-op.
-3. **CodePipeline concurrency guard.** Ensure the Model Promotion CodePipeline's `executionMode` is set to `QUEUED` (not `PARALLEL`). This means a second triggering event queues behind an already-running execution rather than launching a parallel run that could cause a race on the RegisterModel step.
-4. **Debounce window (future).** If rapid multi-edit patterns become common, add a short SQS delay queue between EventBridge and the orchestrator Lambda to coalesce events within a window (e.g., 30 seconds) before acting — at the cost of slightly increased promotion latency.
-
-**Operational guidance:** Treat each lifecycle advancement as a deliberate step. Avoid making corrections immediately after a promotion event is fired — wait for the orchestrator acknowledgement (CloudWatch log / EventBridge metrics) before issuing a follow-up edit if a change is needed. When a batch of registry edits is planned (e.g., superseding multiple shadow versions at once), group all `UpdateModelPackage` calls to minimize the number of triggering events emitted.
+**Operational guidance:** Treat each advancement as a deliberate step; the ~60s batch window absorbs a burst automatically (the trade is up to ~60s of debounce latency before a promotion starts). Failing records retry independently (SQS partial-batch failure) and poison messages land in the DLQ.
 
 ---
 
@@ -850,11 +850,11 @@ Each `UpdateModelPackage` call emits a native `SageMaker Model Package State Cha
 
 | Role | Persona | Can do |
 |------|---------|--------|
-| **Data Scientist (DS)** | Builds & experiments with models | Set `Development` stage, mark `Shadow` or `Experimental` |
+| **Data Scientist (DS)** | Builds & experiments with models | Set `Development` stage; may set `StageStatus=Shadow` / `Retired` (not `Release`) |
 | **ML Engineer (MLE)** | Operates pipelines, blesses models for stage | Everything DS can do + `Approved` + `StageStatus=Release` + advance to `Staging` |
 | **ML Lead / Principal CloudOps** | Production gatekeeper | Everything MLE can do + advance to `Production` |
-| **Automation (training/quality-gate)** | CI/CD service roles | Register + `PendingQualityGate` / `QualityGatePassed` / `QualityGateFailed` only |
-| **RegisterModel (target-account Lambda)** | Projection writer | Set `Active` / `Superseded` / `Rejected` in target registry only |
+| **Automation (registry-sync)** | Deploy-time service role | Register versions with `PendingApproval` + ensure Model Package Groups only |
+| **RegisterModel / fast-path (target-account Lambda)** | Projection writer | Set `Release` / `Shadow` / `Retired` / `Rejected` in the target registry only |
 
 ### Permission matrix
 
@@ -862,17 +862,15 @@ Each `UpdateModelPackage` call emits a native `SageMaker Model Package State Cha
 |--------|:--:|:---:|:-------:|:----------:|:-------------:|
 | Register (`CreateModelPackage`) | — | — | — | ✅ | ✅ (target) |
 | Set `Stage=Development` | ✅ | ✅ | ✅ | ✅ | — |
-| Set `StageStatus=PendingQualityGate` | — | — | — | ✅ | — |
-| Set `StageStatus=QualityGatePassed/Failed` | — | — | — | ✅ | — |
-| Set `StageStatus=Shadow` (Development) | ✅ | ✅ | ✅ | — | — |
-| Set `StageStatus=Experimental` | ✅ | ✅ | ✅ | — | — |
-| Set `StageStatus=Release` (Development) | ❌ | ✅ | ✅ | — | — |
-| Set `StageStatus=Rejected` | ✅ | ✅ | ✅ | — | — |
+| Set `StageStatus=PendingApproval` | — | — | — | ✅ | — |
+| Set `StageStatus=Shadow` | ✅ | ✅ | ✅ | — | — |
+| Set `StageStatus=Release` (**the quality gate**) | ❌ | ✅ | ✅ | — | — |
+| Set `StageStatus=Retired` (de-shadow) | ✅ | ✅ | ✅ | — | — |
 | Set `ModelApprovalStatus=Approved` | ❌ | ✅ | ✅ | — | ✅ (target) |
 | Set `ModelApprovalStatus=Rejected` | ❌ | ✅ | ✅ | — | — |
 | Set `Stage=Staging` | ❌ | ✅ | ✅ | — | — |
 | Set `Stage=Production` | ❌ | ❌ | ✅ | — | — |
-| Set `StageStatus=Active/Superseded` (target) | — | — | — | — | ✅ |
+| Set `StageStatus=Release/Retired` (target) | — | — | — | — | ✅ |
 | Write to stage/prod registry | ❌ | ❌ | ❌ | — | ✅ |
 
 ### IAM enforcement
@@ -889,7 +887,7 @@ Gate lifecycle transitions natively via `sagemaker:ModelLifeCycle:stage` / `:sta
   "Condition": {
     "StringEquals": { "sagemaker:ModelLifeCycle:stage": "Development" },
     "StringEqualsIfExists": {
-      "sagemaker:ModelLifeCycle:stageStatus": ["PendingQualityGate", "Shadow", "Experimental", "Rejected"]
+      "sagemaker:ModelLifeCycle:stageStatus": ["PendingApproval", "Shadow", "Retired"]
     }
   }
 }
@@ -984,7 +982,7 @@ Most of the net-new apparatus is a *choice*, not a requirement. Build it in tier
 
 ### Tier 2 — The prod approval gate: CodePipeline (chosen) vs SSM Automation (deferred)
 
-The core requirement is a **human approval gate** that blocks `RegisterModel` from writing `Approved + Active` to the prod registry until an ML Lead explicitly approves. Two viable implementations were considered; **Option A (CodePipeline) is the chosen approach** — SSM Automation Documents have not yet been approved in the shared services account:
+The core requirement is a **human approval gate** that blocks `RegisterModel` from writing `Approved + StageStatus=Release` to the prod registry until an ML Lead explicitly approves. Two viable implementations were considered; **Option A (CodePipeline) is the chosen approach** — SSM Automation Documents have not yet been approved in the shared services account:
 
 #### Option A — Model Promotion CodePipeline (manifest-triggered)
 
@@ -998,7 +996,7 @@ The currently designed approach. A CodePipeline per target account watches a man
 **What the manifest is:** a machine-generated JSON file written by the orchestrator Lambda — not manually edited. Shape:
 ```json
 { "action": "promote", "family": "fraud", "model": "txn_scorer", "version": "20260416_2253",
-  "stage_status": "Release", "source_gold": "s3://bcnc-gold-mlops-hub-dev-us-east-1/...",
+  "role": "Release", "source_gold": "s3://bcnc-gold-mlops-hub-dev-us-east-1/...",
   "target_gold": "s3://bcnc-gold-mlops-hub-stage-us-east-1/..." }
 ```
 
@@ -1039,7 +1037,7 @@ mainSteps:
     action: aws:invokeLambdaFunction
     inputs:
       FunctionName: "arn:aws:lambda:...:RegisterModelFunction"
-      Payload: '{"model_package_arn": "{{ModelPackageArn}}", "stage_status": "{{StageStatus}}"}'
+      Payload: '{"model_package_arn": "{{ModelPackageArn}}", "role": "{{StageStatus}}"}'
 ```
 
 #### Comparison
@@ -1073,11 +1071,11 @@ mainSteps:
 Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate), **[Opt]** = Tier 3.
 
 - [ ] **[Core]** Rewrite the registry-sync Lambda: **keep** Model Package Group creation; **remove** the catalog version-sync AND the catalog-enforcement logic (the Reject-on-not-in-catalog behavior). RegisterModel becomes sole status authority — do not retain catalog status enforcement.
-- [ ] **[Core]** Stop baking `MODEL_VERSION`; select latest `Approved` + `StageStatus ∈ {Active, Release}` via `DescribeModelPackage` → `ModelLifeCycle`.
-- [ ] **[Core]** RegisterModel Lambda (local, idempotent, sets `Approved` + `StageStatus=Active`; marks previous version `Superseded`).
+- [ ] **[Core]** Stop baking `MODEL_VERSION`; select latest `Approved` + `StageStatus=Release` via `DescribeModelPackage` → `ModelLifeCycle`.
+- [ ] **[Core]** RegisterModel Lambda (local, idempotent, sets `Approved` + `StageStatus=Release`; marks previous version `Retired`).
 - [ ] **[Core]** CopyModels — reuse the existing copy CodeBuild project (us-east-1) to copy artifact into target gold.
 - [ ] **[Gate]** Prod approval gate: **Model Promotion CodePipeline** (chosen approach) — per account (S3 source → CopyModels → Manual Approval → RegisterModel) + manifest bucket in `mlops-hub` + cross-account grants X1–X5. (SSM Automation Documents are a potential future path but not yet approved in the shared services account.)
-- [ ] **[Core]** Adopt `ModelLifeCycle` as the sole governance mechanism: training registers with `Development / PendingQualityGate`; human bless sets `Approved` + `StageStatus=Release` (or `Shadow`); advancing `Stage=Staging` / `Stage=Production` triggers promotion. Verify `ModelLifeCycle` is exposed by the pinned `aws-cdk-lib` / runtime boto3 (GA Nov 2024) before relying on it.
+- [ ] **[Core]** Adopt `ModelLifeCycle` as the sole governance mechanism: training registers with `Development / PendingApproval`; human bless sets `Approved` + `StageStatus=Release` (or `Shadow`); advancing `Stage=Staging` / `Stage=Production` triggers promotion. Verify `ModelLifeCycle` is exposed by the pinned `aws-cdk-lib` / runtime boto3 (GA Nov 2024) before relying on it.
 - [ ] **[Core]** IAM-restrict `Stage=Production` to the ML Lead role; `Stage=Staging` to MLE + ML Lead; `StageStatus=Release` to MLE + ML Lead. Use `sagemaker:ModelLifeCycle:stage` / `:stageStatus` condition keys + explicit Deny on DS/MLE for Production.
 - [ ] **[Opt]** EventBridge rule on `SageMaker Model Package State Change` filtered to `detail.UpdatedModelPackageFields` containing `ModelLifeCycle` or `ModelApprovalStatus` → orchestrator. Handles both promote and de-promote. (No custom `PutEvents`, no CloudTrail fallback.)
 - [ ] **[Opt]** Dev orchestrator Lambda: read `Stage` + `StageStatus` from the event payload, validate eligibility (`Approved` + `StageStatus ∈ {Release, Shadow}` for promote; `Rejected` for de-promote), route to the correct target account; idempotent.
@@ -1096,15 +1094,15 @@ Tagged by tier: **[Core]** = Tier 1, **[Gate]** = Tier 2 (CodePipeline/prod gate
 | Dev registry = single governance source | All UI in dev; stage and prod registries are projections written only by RegisterModel |
 | No custom governance tags | `promote`, `candidate_type`, `quality_gate_passed` are replaced by `ModelLifeCycle.StageStatus`. Only lineage metadata (`version`, `git_sha`, etc.) stays as `CustomerMetadataProperties`. |
 | Reconcile enforcement first | The registry-sync Lambda's catalog enforcement rejects non-catalog versions every deploy — remove it before anything else |
-| Runtime selection, no redeploy | Selection at execution time via `StageStatus ∈ {Active, Release}`; infra pipeline runs only for structure changes |
+| Runtime selection, no redeploy | Selection at execution time via `StageStatus=Release`; infra pipeline runs only for structure changes |
 | Approval blesses, `ModelLifeCycle.Stage` moves | `Approved` + `StageStatus=Release` (or `Shadow`) blesses; advancing `Stage=Staging` then `=Production` is the manual trigger |
 | Native lifecycle event fires the trigger | Advancing `Stage` in Studio emits a native event → EventBridge → orchestrator routes by `Stage` + `StageStatus` from the event payload |
 | Orchestrator handles promote AND de-promote | Same EventBridge rule; `Rejected` status/StageStatus triggers de-promote manifests to target accounts |
 | `ModelApprovalStatus=Rejected` = global kill | Propagates to all envs. `StageStatus=Rejected` = per-env removal. Most rollbacks = promote previous version (auto-supersedes). |
 | Lifecycle stage is IAM-gated | DS: Development only. MLE: Dev + Staging. ML Lead: full including Production. Explicit Deny blocks Production for non-Leads. |
 | Orchestrator idempotent on re-fire | Duplicate native events → deterministic manifest + idempotent RegisterModel → no-op |
-| Prod gate precedes the Approved write | RegisterModel writes `Approved` + `Active` only after the CodePipeline manual approval gate |
-| RegisterModel idempotent | Match by source timestamp; update instead of duplicate; mark previous version `Superseded` |
+| Prod gate precedes the Approved write | RegisterModel writes `Approved` + `StageStatus=Release` only after the CodePipeline manual approval gate |
+| RegisterModel idempotent | Match by source timestamp; update instead of duplicate; mark previous version `Retired` |
 | Registry writes IAM-locked | Only RegisterModel role may write stage/prod (enforced by SCP / resource policy) |
 | Forward-only gate = stage-gold HeadObject | Checks artifact presence before prod promotion; needs grant X4; transient 403/404 retryable |
 | Shared buckets owned by `mlops-hub` | gold/ephemeral + manifest bucket created by `mlops-hub`, imported via `from_bucket_name()` — cross-account grants (X1–X4) added in `mlops-hub`, not locally |
